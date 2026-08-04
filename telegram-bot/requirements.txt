@@ -2,12 +2,12 @@
 pyrogram==2.0.106
 TgCrypto==1.2.5          # Required C extension for fast crypto (speeds up Pyrogram)
 
-# Voice chat streaming
-pytgcalls==3.0.0.dev32   # Async Python binding for tgcalls
-tgcalls                   # Native bindings (pulled by pytgcalls)
+# Voice chat streaming — DISABLED until music system is re-enabled
+# pytgcalls==3.0.0.dev32
+# tgcalls
 
-# Audio download & extraction
-yt-dlp>=2024.4.9
+# Audio download & extraction — DISABLED until music system is re-enabled
+# yt-dlp>=2024.4.9
 
 # Environment variable loading
 python-dotenv>=1.0.1

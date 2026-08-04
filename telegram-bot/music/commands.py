@@ -1,107 +1,105 @@
 """
-music/commands.py — Telegram command handlers for music playback.
+music/commands.py — Music command handlers (simplified / placeholder mode).
 
-Registers: /play, /stop, /pause, /resume, /skip
+The full pytgcalls + Assistant streaming logic is commented out.
+All music commands return a friendly "coming soon" message until
+the music system is re-enabled.
 """
+
+# ─── Imports needed when music is fully enabled — DISABLED ────────────────────
+# from assistant.userbot import ensure_in_group
+# from music import player
 
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from assistant.userbot import ensure_in_group
-from music import player
-
 logger = logging.getLogger(__name__)
+
+_COMING_SOON = (
+    "🎵 Music system will be enabled soon!\n"
+    "Stay tuned for voice chat playback support."
+)
 
 
 def register(bot: Client) -> None:
-    """Attach all music command handlers to the bot client."""
+    """Register placeholder music command handlers."""
 
-    # ─── /play ────────────────────────────────────────────────────────────────
-    @bot.on_message(filters.command("play") & (filters.group | filters.supergroup))
+    @bot.on_message(filters.command("play"))
     async def play_handler(client: Client, message: Message) -> None:
-        """
-        Usage: /play <song title or YouTube URL>
+        await message.reply_text(_COMING_SOON, quote=True)
 
-        1. Ensures the Assistant is in the group.
-        2. Resolves the audio URL via yt-dlp.
-        3. Joins the Voice Chat and starts streaming.
-        """
-        # Extract query (everything after /play)
-        args = message.text.split(None, 1)
-        if len(args) < 2 or not args[1].strip():
-            await message.reply_text(
-                "❓ Please provide a song name or URL.\n"
-                "Example: `/play Shape of You`",
-                quote=True,
-            )
-            return
-
-        query = args[1].strip()
-        chat_id = message.chat.id
-
-        status_msg = await message.reply_text("🔍 Searching…", quote=True)
-
-        # Step 1 — Make sure the assistant is in the group
-        in_group = await ensure_in_group(bot, chat_id)
-        if not in_group:
-            await status_msg.edit_text(
-                "❌ Could not add the Assistant to this group.\n"
-                "Please add it manually and try again."
-            )
-            return
-
-        # Step 2 — Resolve & play
-        try:
-            result = await player.play(chat_id, query)
-            await status_msg.edit_text(f"🎵 Now playing: **{result}**")
-        except Exception as exc:
-            logger.exception("Error during /play in chat %s", chat_id)
-            await status_msg.edit_text(f"❌ Failed to play: `{exc}`")
-
-    # ─── /stop ────────────────────────────────────────────────────────────────
-    @bot.on_message(filters.command("stop") & (filters.group | filters.supergroup))
+    @bot.on_message(filters.command("stop"))
     async def stop_handler(client: Client, message: Message) -> None:
-        """Stop playback and leave the voice chat."""
-        try:
-            await player.stop(message.chat.id)
-            await message.reply_text("⏹ Stopped and left the voice chat.", quote=True)
-        except Exception as exc:
-            logger.exception("Error during /stop in chat %s", message.chat.id)
-            await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+        await message.reply_text(_COMING_SOON, quote=True)
 
-    # ─── /pause ───────────────────────────────────────────────────────────────
-    @bot.on_message(filters.command("pause") & (filters.group | filters.supergroup))
+    @bot.on_message(filters.command("pause"))
     async def pause_handler(client: Client, message: Message) -> None:
-        """Pause the currently playing track."""
-        try:
-            await player.pause(message.chat.id)
-            await message.reply_text("⏸ Paused.", quote=True)
-        except Exception as exc:
-            logger.exception("Error during /pause in chat %s", message.chat.id)
-            await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+        await message.reply_text(_COMING_SOON, quote=True)
 
-    # ─── /resume ──────────────────────────────────────────────────────────────
-    @bot.on_message(filters.command("resume") & (filters.group | filters.supergroup))
+    @bot.on_message(filters.command("resume"))
     async def resume_handler(client: Client, message: Message) -> None:
-        """Resume a paused track."""
-        try:
-            await player.resume(message.chat.id)
-            await message.reply_text("▶️ Resumed.", quote=True)
-        except Exception as exc:
-            logger.exception("Error during /resume in chat %s", message.chat.id)
-            await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+        await message.reply_text(_COMING_SOON, quote=True)
 
-    # ─── /skip ────────────────────────────────────────────────────────────────
-    @bot.on_message(filters.command("skip") & (filters.group | filters.supergroup))
+    @bot.on_message(filters.command("skip"))
     async def skip_handler(client: Client, message: Message) -> None:
-        """Skip the current track and play the next one in the queue."""
-        try:
-            next_title = await player.skip(message.chat.id)
-            if next_title:
-                await message.reply_text(f"⏭ Skipped! Now playing: **{next_title}**", quote=True)
-            else:
-                await message.reply_text("⏭ Skipped! No more tracks in the queue.", quote=True)
-        except Exception as exc:
-            logger.exception("Error during /skip in chat %s", message.chat.id)
-            await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+        await message.reply_text(_COMING_SOON, quote=True)
+
+    # ─── Full music handlers — DISABLED ───────────────────────────────────────
+    # Uncomment the block below and remove the placeholders above
+    # to re-enable the full music system.
+    #
+    # @bot.on_message(filters.command("play") & (filters.group | filters.supergroup))
+    # async def play_handler(client: Client, message: Message) -> None:
+    #     args = message.text.split(None, 1)
+    #     if len(args) < 2 or not args[1].strip():
+    #         await message.reply_text("❓ Usage: `/play <song or URL>`", quote=True)
+    #         return
+    #     query = args[1].strip()
+    #     chat_id = message.chat.id
+    #     status_msg = await message.reply_text("🔍 Searching…", quote=True)
+    #     in_group = await ensure_in_group(bot, chat_id)
+    #     if not in_group:
+    #         await status_msg.edit_text("❌ Could not add the Assistant to this group.")
+    #         return
+    #     try:
+    #         result = await player.play(chat_id, query)
+    #         await status_msg.edit_text(f"🎵 Now playing: **{result}**")
+    #     except Exception as exc:
+    #         logger.exception("Error during /play in chat %s", chat_id)
+    #         await status_msg.edit_text(f"❌ Failed to play: `{exc}`")
+    #
+    # @bot.on_message(filters.command("stop") & (filters.group | filters.supergroup))
+    # async def stop_handler(client: Client, message: Message) -> None:
+    #     try:
+    #         await player.stop(message.chat.id)
+    #         await message.reply_text("⏹ Stopped and left the voice chat.", quote=True)
+    #     except Exception as exc:
+    #         await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+    #
+    # @bot.on_message(filters.command("pause") & (filters.group | filters.supergroup))
+    # async def pause_handler(client: Client, message: Message) -> None:
+    #     try:
+    #         await player.pause(message.chat.id)
+    #         await message.reply_text("⏸ Paused.", quote=True)
+    #     except Exception as exc:
+    #         await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+    #
+    # @bot.on_message(filters.command("resume") & (filters.group | filters.supergroup))
+    # async def resume_handler(client: Client, message: Message) -> None:
+    #     try:
+    #         await player.resume(message.chat.id)
+    #         await message.reply_text("▶️ Resumed.", quote=True)
+    #     except Exception as exc:
+    #         await message.reply_text(f"❌ Error: `{exc}`", quote=True)
+    #
+    # @bot.on_message(filters.command("skip") & (filters.group | filters.supergroup))
+    # async def skip_handler(client: Client, message: Message) -> None:
+    #     try:
+    #         next_title = await player.skip(message.chat.id)
+    #         if next_title:
+    #             await message.reply_text(f"⏭ Skipped! Now playing: **{next_title}**", quote=True)
+    #         else:
+    #             await message.reply_text("⏭ Queue is now empty.", quote=True)
+    #     except Exception as exc:
+    #         await message.reply_text(f"❌ Error: `{exc}`", quote=True)

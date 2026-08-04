@@ -1,6 +1,6 @@
 """
 config.py — Centralized configuration loader.
-Reads environment variables from .env (local) or Railway environment.
+Reads environment variables from .env (local) or Railway/Replit environment.
 """
 
 import os
@@ -16,10 +16,10 @@ API_HASH: str = os.environ.get("API_HASH", "")
 # ─── Main Bot ─────────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 
-# ─── Assistant Userbot (string session from Pyrogram) ─────────────────────────
-ASSISTANT_SESSION_STRING: str = os.environ.get("ASSISTANT_SESSION_STRING", "")
+# ─── Assistant Userbot — DISABLED for now ─────────────────────────────────────
+# ASSISTANT_SESSION_STRING: str = os.environ.get("ASSISTANT_SESSION_STRING", "")
 
-# ─── Validation ───────────────────────────────────────────────────────────────
+
 def validate_config() -> None:
     """Raise a descriptive error if any required variable is missing."""
     missing = []
@@ -29,8 +29,6 @@ def validate_config() -> None:
         missing.append("API_HASH")
     if not BOT_TOKEN:
         missing.append("BOT_TOKEN")
-    if not ASSISTANT_SESSION_STRING:
-        missing.append("ASSISTANT_SESSION_STRING")
     if missing:
         raise EnvironmentError(
             f"Missing required environment variables: {', '.join(missing)}\n"

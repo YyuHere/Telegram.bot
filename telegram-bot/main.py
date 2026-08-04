@@ -1,13 +1,9 @@
 """
-main.py — Entry point for the Telegram Bot + Assistant Userbot.
+main.py — Entry point for the Telegram Bot.
 
-Start order:
-  1. Validate config (fail fast on missing env vars).
-  2. Create the main Bot client.
-  3. Register all handlers (general, ludo, music).
-  4. Start the Assistant userbot client.
-  5. Start the pytgcalls instance (attached to the Assistant).
-  6. Run both clients until Ctrl-C or SIGTERM.
+Simplified mode: runs the Main Bot only.
+Assistant userbot and pytgcalls are commented out until the music
+system is re-enabled.
 """
 
 import asyncio
@@ -20,8 +16,10 @@ import config
 from config import API_ID, API_HASH, BOT_TOKEN
 from handlers import general, ludo
 from music import commands as music_commands
-from music.player import call_py
-from assistant.userbot import assistant
+
+# ─── Assistant / pytgcalls imports — DISABLED ─────────────────────────────────
+# from music.player import call_py
+# from assistant.userbot import assistant
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    # 1. Validate environment
+    # 1. Validate environment (only BOT_TOKEN, API_ID, API_HASH required)
     config.validate_config()
 
     # 2. Create the main bot client
@@ -47,22 +45,20 @@ async def main() -> None:
     # 3. Register handlers
     general.register(bot)
     ludo.register(bot)
-    music_commands.register(bot)
+    music_commands.register(bot)   # placeholder responses only for now
 
-    # 4 & 5. Start clients
-    logger.info("Starting Assistant userbot…")
-    await assistant.start()
+    # ─── Assistant / pytgcalls startup — DISABLED ─────────────────────────────
+    # await assistant.start()
+    # await call_py.start()
 
-    logger.info("Starting pytgcalls…")
-    await call_py.start()
-
+    # 4. Start the main bot
     logger.info("Starting main bot…")
     await bot.start()
 
     me = await bot.get_me()
     logger.info("Bot running as @%s (id=%s)", me.username, me.id)
 
-    # 6. Keep running until interrupted
+    # 5. Keep running until interrupted
     stop_event = asyncio.Event()
 
     def _shutdown(*_):
@@ -74,10 +70,9 @@ async def main() -> None:
 
     await stop_event.wait()
 
-    # ─── Graceful shutdown ────────────────────────────────────────────────────
-    logger.info("Stopping clients…")
+    # 6. Graceful shutdown
+    logger.info("Stopping bot…")
     await bot.stop()
-    await assistant.stop()
     logger.info("Bye!")
 
 
