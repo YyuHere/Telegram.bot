@@ -1,0 +1,13 @@
+# Core Telegram library (MTProto)
+pyrogram==2.0.106
+TgCrypto==1.2.5          # Required C extension for fast crypto (speeds up Pyrogram)
+
+# Voice chat streaming
+pytgcalls==3.0.0.dev32   # Async Python binding for tgcalls
+tgcalls                   # Native bindings (pulled by pytgcalls)
+
+# Audio download & extraction
+yt-dlp>=2024.4.9
+
+# Environment variable loading
+python-dotenv>=1.0.1
