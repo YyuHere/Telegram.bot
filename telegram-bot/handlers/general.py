@@ -11,30 +11,57 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome message with feature overview."""
     await update.message.reply_text(
-        "👋 *Hello! I'm your Telegram Assistant Bot.*\n\n"
-        "Here's what I can do:\n\n"
-        "🎮 *Ludo Club*\n"
-        "  • Auto-extracts referral codes from invite links or messages\\.\n\n"
-        "🎵 *Music \\(Voice Chat — coming soon\\)*\n"
-        "  • `/play <song or URL>` — Play audio in a voice chat\\.\n"
-        "  • `/pause`, `/resume`, `/skip`, `/stop`\n\n"
-        "🛠 *Utilities*\n"
-        "  • `/ping` — Check my response time\\.\n"
-        "  • `/help` — Show this help message\\.",
+        "👋 *أهلاً\\! أنا بوت إدارة المجموعات\\.*\n\n"
+        "يمكنك استخدامي لـ:\n\n"
+        "🛡 *إدارة المجموعة* — حظر، طرد، كتم، ورفع الحظر\\.\n"
+        "🎮 *لودو كلوب* — استخراج أكواد الدعوة تلقائياً\\.\n\n"
+        "اكتب /help لعرض قائمة الأوامر الكاملة\\.",
         parse_mode="MarkdownV2",
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Concise command reference."""
+    """Full command reference — moderation + utilities."""
     await update.message.reply_text(
-        "📖 *Command Reference*\n\n"
-        "`/start`  — Welcome & overview\n"
-        "`/ping`   — Response latency\n"
-        "`/help`   — This message\n\n"
-        "`/play <song/URL>` — Play music \\(coming soon\\)\n"
-        "`/pause` \\| `/resume` \\| `/skip` \\| `/stop`\n\n"
-        "🎮 I also auto\\-extract Ludo Club codes — just share a link in the group\\!",
+        "📖 *دليل الأوامر*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "🛡 *أوامر الإدارة* \\(للمشرفين فقط\\)\n\n"
+
+        "🔨 *الحظر*\n"
+        "`/ban` \\| `بان` \\| `حظر`\n"
+        "حظر مستخدم نهائياً من المجموعة\\.\n"
+        "_رد على رسالته أو اكتب_ `بان @username`\n\n"
+
+        "✅ *رفع الحظر*\n"
+        "`/unban` \\| `الغاء الحظر` \\| `الغاء بان`\n"
+        "رفع الحظر والسماح للمستخدم بالعودة\\.\n"
+        "_رد على رسالته أو اكتب_ `الغاء الحظر @username`\n\n"
+
+        "👢 *الطرد*\n"
+        "`/kick` \\| `طرد`\n"
+        "طرد المستخدم مع إمكانية العودة عبر رابط دعوة\\.\n"
+        "_رد على رسالته أو اكتب_ `طرد @username`\n\n"
+
+        "🔇 *الكتم*\n"
+        "`/mute` \\| `كتم`\n"
+        "منع المستخدم من إرسال الرسائل\\.\n"
+        "_رد على رسالته أو اكتب_ `كتم @username`\n\n"
+
+        "🔊 *إلغاء الكتم*\n"
+        "`/unmute` \\| `الغاء الكتم` \\| `الغاء كتم`\n"
+        "إعادة صلاحية الإرسال للمستخدم\\.\n"
+        "_رد على رسالته أو اكتب_ `الغاء الكتم @username`\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎮 *لودو كلوب*\n"
+        "يقوم البوت تلقائياً باستخراج كود الدعوة من أي رسالة تحتوي على رابط لودو كلوب أو نص مثل `enter my Code: WAKL189`\\.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🛠 *الأوامر العامة*\n"
+        "`/start` — رسالة الترحيب\n"
+        "`/ping` — اختبار سرعة الاستجابة\n"
+        "`/help` — هذه القائمة",
         parse_mode="MarkdownV2",
     )
 

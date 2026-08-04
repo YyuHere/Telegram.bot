@@ -1,11 +1,14 @@
 """
-main.py — Entry point for the Telegram Bot (simplified bot-only mode).
+main.py — Entry point for the Telegram Bot.
 
 Stack: python-telegram-bot v21 (async polling).
-Requires only: BOT_TOKEN (set as a Replit Secret or in .env).
+Requires only: BOT_TOKEN (Replit Secret).
 
-Assistant userbot and pytgcalls are disabled until the music system
-is re-enabled in a later phase.
+Features active:
+  - Group moderation commands (ban/unban/kick/mute/unmute)
+  - Arabic text triggers for all moderation actions
+  - Ludo Club referral code extractor
+  - General commands: /start, /help, /ping
 """
 
 import logging
@@ -13,7 +16,7 @@ from telegram.ext import Application
 
 import config
 from config import BOT_TOKEN
-from handlers import general, ludo
+from handlers import general, ludo, moderation
 from music import commands as music_commands
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -32,10 +35,11 @@ def main() -> None:
     # 2. Build the Application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # 3. Register all handlers
-    general.register(app)   # /start, /help, /ping
-    ludo.register(app)      # Ludo Club code extractor
-    music_commands.register(app)  # /play, /stop, /pause, /resume, /skip (placeholders)
+    # 3. Register handlers (order matters: more specific handlers first)
+    general.register(app)          # /start, /help, /ping
+    moderation.register(app)       # /ban /unban /kick /mute /unmute + Arabic triggers
+    ludo.register(app)             # Ludo Club code extractor
+    music_commands.register(app)   # /play etc. — placeholder responses
 
     # 4. Start polling
     logger.info("Bot is starting — polling for updates…")
