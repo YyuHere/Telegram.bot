@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+import config
 from music import player
 
 logger = logging.getLogger(__name__)
@@ -121,11 +122,19 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("الرجاء كتابة اسم الاغنيه لتشغيلها")
         return
 
-    # Check assistant is configured
-    if player.call_py is None:
+    # Check 1: env vars must be present
+    if not config.ASSISTANT_ENABLED:
         await msg.reply_text(
             "⚠️ موسيقى الصوت غير متاحة.\n"
             "يجب ضبط `API_ID` و `API_HASH` و `ASSISTANT_SESSION_STRING` أولاً."
+        )
+        return
+
+    # Check 2: PyTgCalls must have initialised successfully
+    if player.call_py is None:
+        await msg.reply_text(
+            "⚠️ فشل تهيئة محرك الصوت (PyTgCalls).\n"
+            "يرجى مراجعة سجلات الخادم."
         )
         return
 
