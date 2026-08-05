@@ -1,45 +1,50 @@
-# [Project name]
+# Telegram Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
-
-## Run & Operate
-
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+A Python Telegram bot with group moderation, Ludo Club referral code extraction, and music/voice chat features.
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- **Runtime:** Python 3.11+
+- **Framework:** python-telegram-bot v21 (async polling)
+- **Database:** SQLite (`telegram-bot/members.db`)
+- **Optional userbot:** Pyrogram + pytgcalls for voice chat
 
-## Where things live
+## Project Structure
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+```
+telegram-bot/
+├── main.py                  # Entry point
+├── config.py                # Environment variable loader & validator
+├── generate_session.py      # One-time helper: generate Assistant session string
+├── requirements.txt
+├── handlers/
+│   ├── general.py           # /start, /help, /ping
+│   ├── moderation.py        # /ban /unban /kick /mute /unmute + Arabic triggers
+│   └── ludo.py              # Ludo Club code extractor
+├── music/
+│   ├── player.py            # pytgcalls audio engine + queue
+│   └── commands.py          # /play, /stop, /pause, /resume, /skip
+└── assistant/
+    └── userbot.py           # Pyrogram userbot client + group-join helper
+```
 
-## Architecture decisions
+## Running the Bot
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+The bot requires a `BOT_TOKEN` secret (set via Replit Secrets).
 
-## Product
+```bash
+cd telegram-bot && python main.py
+```
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+## Required Secrets
 
-## User preferences
+| Secret | Description | Required |
+|---|---|---|
+| `BOT_TOKEN` | Bot token from @BotFather | Yes |
+| `API_ID` | From my.telegram.org/apps | Only for music/voice |
+| `API_HASH` | From my.telegram.org/apps | Only for music/voice |
+| `ASSISTANT_SESSION_STRING` | Pyrogram session (run `generate_session.py` once) | Only for music/voice |
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+## User Preferences
 
-## Gotchas
-
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+<!-- Add any agent preferences here -->
