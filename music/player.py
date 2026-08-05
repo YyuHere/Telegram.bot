@@ -394,6 +394,85 @@ def get_audio_info(query: str) -> TrackInfo:
     )
 
 
+# ─── Voice chat lifecycle ─────────────────────────────────────────────────────
+
+# Keywords found in py-tgcalls / Telegram error messages that indicate there
+# is no active group call in the chat (as opposed to auth/network failures).
+_NO_CALL_KEYWORDS = (
+    "no active",
+    "not found",
+    "groupcall_forbidden",
+    "groupcall_invalid",
+    "group call",
+    "call not found",
+    "chat not found",
+)
+
+
+async def _create_voice_chat(chat_id: int) -> None:
+    """
+    Start a new Telegram Voice Chat in *chat_id* using the Pyrogram assistant's
+    raw MTProto API (phone.CreateGroupCall).
+
+    This is necessary because py-tgcalls cannot join a call that does not yet
+    exist — the assistant must create it first.  Silently ignores
+    GROUPCALL_ALREADY_STARTED so callers don't need to pre-check.
+    """
+    if assistant is None:
+        raise RuntimeError(
+            "Pyrogram assistant is not configured — cannot create a voice chat. "
+            "Set API_ID, API_HASH, and ASSISTANT_SESSION_STRING."
+        )
+
+    import random
+    from pyrogram.raw.functions.phone import CreateGroupCall
+
+    try:
+        peer = await assistant.resolve_peer(chat_id)
+        await assistant.invoke(
+            CreateGroupCall(
+                peer=peer,
+                random_id=random.randint(1, 2 ** 31 - 1),
+            )
+        )
+        logger.info("Voice chat created in chat %s — waiting for Telegram to activate it.", chat_id)
+        # Give Telegram ~1.5 s to activate the call before we try to join.
+        await asyncio.sleep(1.5)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "already_started" in err or "already started" in err:
+            # Call already exists — nothing to do, join will work.
+            logger.debug("_create_voice_chat: call already active in chat %s", chat_id)
+        else:
+            # Surface unexpected errors so they appear in logs.
+            logger.warning("_create_voice_chat failed for chat %s: %s", chat_id, exc)
+            raise
+
+
+async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
+    """
+    Call ``call_py.join_group_call()``, and if Telegram reports no active voice
+    chat, automatically create one via ``_create_voice_chat()`` and retry once.
+
+    This makes ``/play`` work seamlessly even when no admin has manually opened
+    a Voice Chat in the group.
+    """
+    try:
+        await call_py.join_group_call(chat_id, stream)
+    except Exception as exc:
+        err = str(exc).lower()
+        if not any(kw in err for kw in _NO_CALL_KEYWORDS):
+            raise  # unrelated error — don't swallow it
+
+        logger.info(
+            "No active voice chat in chat %s (%s) — creating one and retrying.",
+            chat_id, exc,
+        )
+        await _create_voice_chat(chat_id)
+        # One retry after the call is created.
+        await call_py.join_group_call(chat_id, stream)
+
+
 # ─── Playback control ─────────────────────────────────────────────────────────
 
 async def play(chat_id: int, track: TrackInfo) -> bool:
@@ -403,6 +482,10 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
 
     Returns True if playback started, False if queued.
     Raises if the assistant or PyTgCalls is not available.
+
+    Voice chat auto-creation: if no voice chat is currently open in the group,
+    _join_group_call_with_autocreate() creates one via the Pyrogram assistant
+    before joining, so users never need to open it manually.
     """
     if call_py is None:
         raise RuntimeError("Music assistant is not configured.")
@@ -420,10 +503,7 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
     state["playing"] = True
     state["paused"] = False
 
-    await call_py.join_group_call(
-        chat_id,
-        _make_stream(track["url"]),
-    )
+    await _join_group_call_with_autocreate(chat_id, _make_stream(track["url"]))
     logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
     return True
 
