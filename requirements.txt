@@ -11,5 +11,5 @@ tgcrypto
 # Voice chat streaming (Available version in PyPI list)
 py-tgcalls==0.9.7
 
-# Audio download / stream URL resolution
-yt-dlp
+# Audio download / stream URL resolution — always use the latest release
+yt-dlp>=2025.1.1

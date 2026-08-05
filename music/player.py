@@ -201,15 +201,16 @@ def _ydl_opts() -> dict:
     a bot" block on headless / server environments (Railway, Replit, VPS).
 
     Strategy (in priority order):
-      1. Android player client  — YouTube's mobile API skips the bot challenge
-         entirely.  ``extractor_args`` forces yt-dlp to request the Android
-         InnerTube endpoint instead of the web one.
-      2. Cookie file fallback   — If YTDLP_COOKIES_FILE is set in the
+      1. iOS player client     — yt-dlp's ``ios`` InnerTube client bypasses
+         the bot-challenge gate reliably on server IPs.  ``tv_embedded`` and
+         ``web`` are kept as ordered fallbacks so yt-dlp automatically retries
+         them when ``ios`` is throttled or token-expired.
+      2. Cookie file fallback  — If YTDLP_COOKIES_FILE is set in the
          environment (path to a Netscape-format cookies.txt exported from a
-         logged-in browser), those cookies are passed through for extra
-         resilience on heavily rate-limited IPs.
+         logged-in browser), those cookies are attached for extra resilience on
+         heavily rate-limited datacenter IPs.
 
-    The Android client trick is sufficient in the vast majority of cases;
+    The iOS client trick is sufficient in the vast majority of cases;
     the cookie file is an optional belt-and-suspenders measure.
     """
     import os
@@ -219,25 +220,26 @@ def _ydl_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Force the Android InnerTube player — bypasses the bot-check gate
-        # that YouTube applies to headless web requests.
+        # iOS client is the most reliable bypass for YouTube's "Sign in to
+        # confirm you're not a bot" gate on headless/server IPs (2025+).
+        # tv_embedded and web serve as automatic fallbacks inside yt-dlp.
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["ios", "tv_embedded", "web"],
             }
         },
-        # A realistic mobile User-Agent reinforces the Android client identity.
+        # iOS-style User-Agent matches the ios player_client identity.
         "http_headers": {
             "User-Agent": (
-                "com.google.android.youtube/19.09.37 "
-                "(Linux; U; Android 11) gzip"
+                "com.google.ios.youtube/19.29.1 "
+                "(iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X)"
             ),
         },
     }
 
     # Optional: path to a Netscape cookies.txt file exported from a browser.
-    # Set YTDLP_COOKIES_FILE in Railway / Replit Secrets if the Android client
-    # alone is blocked on your IP (e.g. heavily shared datacenter addresses).
+    # Set YTDLP_COOKIES_FILE in Replit/Railway Secrets if the iOS client alone
+    # is blocked on your IP (e.g. heavily shared datacenter addresses).
     cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookie_file and os.path.isfile(cookie_file):
         opts["cookiefile"] = cookie_file
@@ -245,7 +247,7 @@ def _ydl_opts() -> dict:
     else:
         logger.debug(
             "yt-dlp: no YTDLP_COOKIES_FILE set (or file not found) — "
-            "relying on Android client bypass"
+            "relying on iOS client bypass"
         )
 
     return opts
@@ -278,6 +280,28 @@ def _strip_tashkeel(text: str) -> str:
 def _is_url(text: str) -> bool:
     """Return True if *text* looks like a direct URL rather than a search query."""
     return text.startswith(("http://", "https://", "www."))
+
+
+# Common audio-file extensions whose URLs can be piped directly into pytgcalls
+# without going through yt-dlp's extraction step.
+_DIRECT_AUDIO_EXTS = (".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac", ".webm")
+
+
+def _is_direct_audio_url(url: str) -> bool:
+    """Return True when the URL path ends with a known audio extension."""
+    path = url.split("?")[0].lower()
+    return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
+
+
+# yt-dlp error substrings that indicate YouTube's bot-check / sign-in gate.
+_BOT_CHECK_PHRASES = (
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you are not a bot",
+    "bot detection",
+    "this video is not available",   # common disguise for geo/bot blocks
+    "video unavailable",
+)
 
 
 def _search_variants(query: str) -> list[tuple[str, str]]:
@@ -350,6 +374,9 @@ def get_audio_info(query: str) -> TrackInfo:
     Resolve *query* (song name or direct URL) via yt-dlp.
 
     Direct URLs (http/https/www) are resolved immediately without any search.
+    If the URL points to a raw audio file (.mp3, .opus, etc.) it is returned
+    as-is without calling yt-dlp.  If yt-dlp extraction fails for any direct
+    URL, the URL is returned directly so pytgcalls can still attempt to play it.
 
     For text queries the function walks through a staged fallback pipeline
     (see ``_search_variants``) that handles:
@@ -368,14 +395,41 @@ def get_audio_info(query: str) -> TrackInfo:
 
     # ── Direct URL ────────────────────────────────────────────────────────────
     if _is_url(query):
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-        track = _extract_first_valid(info, query)
-        if track:
-            return track
-        raise RuntimeError(f"Could not resolve audio from URL: {query!r}")
+        # Raw audio file — skip yt-dlp entirely, pipe directly to pytgcalls.
+        if _is_direct_audio_url(query):
+            filename = query.split("/")[-1].split("?")[0] or query
+            logger.info("yt-dlp: direct audio URL — skipping extraction for %r", filename)
+            return TrackInfo(url=query, title=filename, duration="0:00", thumbnail="")
+
+        # Attempt yt-dlp extraction; fall back to raw URL on any failure.
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+            track = _extract_first_valid(info, query)
+            if track:
+                return track
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            if any(p in err_lower for p in _BOT_CHECK_PHRASES):
+                logger.warning(
+                    "yt-dlp: YouTube bot-check triggered for URL %r — "
+                    "falling back to direct stream: %s", query, exc
+                )
+            else:
+                logger.warning(
+                    "yt-dlp: extraction failed for URL %r — "
+                    "falling back to direct stream: %s", query, exc
+                )
+            # Return the original URL directly so pytgcalls can still try.
+            filename = query.split("/")[-1].split("?")[0] or query
+            return TrackInfo(url=query, title=filename, duration="0:00", thumbnail="")
+
+        # Extraction returned no usable URL — last-resort direct pass-through.
+        logger.warning("yt-dlp: no usable URL extracted from %r — using raw URL", query)
+        return TrackInfo(url=query, title=query, duration="0:00", thumbnail="")
 
     # ── Staged text search ────────────────────────────────────────────────────
+    _bot_check_hit = False
     for prefix, variant in _search_variants(query):
         search_str = f"{prefix}:{variant}"
         logger.debug("yt-dlp: trying %r", search_str)
@@ -390,11 +444,26 @@ def get_audio_info(query: str) -> TrackInfo:
                 )
                 return track
         except Exception as exc:
-            logger.warning("yt-dlp: %r failed: %s", search_str, exc)
+            err_lower = str(exc).lower()
+            if any(p in err_lower for p in _BOT_CHECK_PHRASES):
+                _bot_check_hit = True
+                logger.warning(
+                    "yt-dlp: YouTube bot-check triggered for %r: %s", search_str, exc
+                )
+            else:
+                logger.warning("yt-dlp: %r failed: %s", search_str, exc)
+
+    if _bot_check_hit:
+        raise RuntimeError(
+            "❌ يوتيوب يطلب تسجيل الدخول للتحقق (Bot Detection).\n"
+            "أرسل رابط YouTube مباشرًا، أو جرّب SoundCloud:\n"
+            "مثال: تشغيل scsearch: اسم الأغنية\n"
+            "أو فعّل YTDLP_COOKIES_FILE في إعدادات البوت."
+        )
 
     raise RuntimeError(
         f"لم يتم العثور على نتائج لـ: {query!r}\n"
-        "جرّب اسمًا آخر للأغنية أو أرسل رابط YouTube مباشرًا."
+        "جرّب اسمًا آخر للأغنية أو أرسل رابط YouTube / SoundCloud مباشرًا."
     )
 
 
