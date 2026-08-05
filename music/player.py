@@ -192,13 +192,60 @@ async def ensure_pytgcalls_started() -> None:
 # ─── yt-dlp helpers ───────────────────────────────────────────────────────────
 
 def _ydl_opts() -> dict:
-    return {
+    """
+    Build yt-dlp options that avoid YouTube's "Sign in to confirm you're not
+    a bot" block on headless / server environments (Railway, Replit, VPS).
+
+    Strategy (in priority order):
+      1. Android player client  — YouTube's mobile API skips the bot challenge
+         entirely.  ``extractor_args`` forces yt-dlp to request the Android
+         InnerTube endpoint instead of the web one.
+      2. Cookie file fallback   — If YTDLP_COOKIES_FILE is set in the
+         environment (path to a Netscape-format cookies.txt exported from a
+         logged-in browser), those cookies are passed through for extra
+         resilience on heavily rate-limited IPs.
+
+    The Android client trick is sufficient in the vast majority of cases;
+    the cookie file is an optional belt-and-suspenders measure.
+    """
+    import os
+
+    opts: dict = {
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch",
         "noplaylist": True,
+        # Force the Android InnerTube player — bypasses the bot-check gate
+        # that YouTube applies to headless web requests.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
+        # A realistic mobile User-Agent reinforces the Android client identity.
+        "http_headers": {
+            "User-Agent": (
+                "com.google.android.youtube/19.09.37 "
+                "(Linux; U; Android 11) gzip"
+            ),
+        },
     }
+
+    # Optional: path to a Netscape cookies.txt file exported from a browser.
+    # Set YTDLP_COOKIES_FILE in Railway / Replit Secrets if the Android client
+    # alone is blocked on your IP (e.g. heavily shared datacenter addresses).
+    cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_file and os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
+        logger.debug("yt-dlp: using cookie file %s", cookie_file)
+    else:
+        logger.debug(
+            "yt-dlp: no YTDLP_COOKIES_FILE set (or file not found) — "
+            "relying on Android client bypass"
+        )
+
+    return opts
 
 
 def _fmt_duration(secs: int) -> str:

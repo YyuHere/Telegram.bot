@@ -48,6 +48,7 @@ Optional secrets (enable full member sync via Pyrogram assistant):
 
 Optional:
 - `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
+- `YTDLP_COOKIES_FILE` — path to a Netscape-format `cookies.txt` exported from a logged-in YouTube browser session; only needed if the Android client bypass is blocked on your server IP
 
 ## Deployment
 
