@@ -2,162 +2,295 @@
 music/player.py — Core audio streaming engine.
 
 Uses:
-  • yt-dlp   — Download / stream audio from YouTube and 500+ sites.
-  • pytgcalls — Stream the audio into a Telegram Voice Chat.
+  • yt-dlp     — Download / stream audio from YouTube and 500+ sites.
+  • pytgcalls  — Stream audio into a Telegram Voice Chat via the Assistant userbot.
 
-State is tracked per chat_id in an in-memory dict so the bot can handle
-multiple groups simultaneously.
+Per-chat state tracks the queue, current track, repeat mode, and paused flag
+so the bot can manage multiple groups simultaneously.
 """
 
 import asyncio
 import logging
+from typing import TypedDict
+
 import yt_dlp
-from pytgcalls import PyTgCalls
-from pytgcalls.types import Update
-from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.types.input_stream.quality import HighQualityAudio
 
 from assistant.userbot import assistant
 
 logger = logging.getLogger(__name__)
 
-# ─── pytgcalls instance attached to the Assistant userbot ─────────────────────
-call_py = PyTgCalls(assistant)
+# ─── pytgcalls setup ──────────────────────────────────────────────────────────
+# call_py is only created when the assistant client exists.
+call_py = None
+if assistant is not None:
+    try:
+        from pytgcalls import PyTgCalls
+        from pytgcalls.types.input_stream import AudioPiped
+        from pytgcalls.types.input_stream.quality import HighQualityAudio
+        call_py = PyTgCalls(assistant)
+        logger.info("PyTgCalls instance created.")
+    except Exception as _exc:
+        logger.warning("Failed to create PyTgCalls instance: %s", _exc)
+
+
+# ─── Track info TypedDict ─────────────────────────────────────────────────────
+
+class TrackInfo(TypedDict):
+    url: str
+    title: str
+    duration: str       # "m:ss"
+    thumbnail: str      # URL
+
 
 # ─── Per-chat state ───────────────────────────────────────────────────────────
-# Structure: { chat_id: {"queue": [...], "playing": bool} }
+# Structure: {
+#   chat_id: {
+#     "queue":   [TrackInfo, ...],
+#     "current": TrackInfo | None,
+#     "playing": bool,
+#     "paused":  bool,
+#     "repeat":  bool,
+#   }
+# }
 _chat_state: dict[int, dict] = {}
 
 
 def _get_state(chat_id: int) -> dict:
     if chat_id not in _chat_state:
-        _chat_state[chat_id] = {"queue": [], "playing": False}
+        _chat_state[chat_id] = {
+            "queue":   [],
+            "current": None,
+            "playing": False,
+            "paused":  False,
+            "repeat":  False,
+        }
     return _chat_state[chat_id]
+
+
+# ─── pytgcalls started flag ───────────────────────────────────────────────────
+_pytgcalls_started = False
+
+
+async def ensure_pytgcalls_started() -> None:
+    """Start the PyTgCalls client once. Safe to call multiple times."""
+    global _pytgcalls_started
+    if call_py is None or _pytgcalls_started:
+        return
+    try:
+        await call_py.start()
+        _pytgcalls_started = True
+        logger.info("PyTgCalls client started.")
+    except Exception as exc:
+        logger.warning("PyTgCalls start failed: %s", exc)
 
 
 # ─── yt-dlp helpers ───────────────────────────────────────────────────────────
 
 def _ydl_opts() -> dict:
-    """Return yt-dlp options for best audio extraction without downloading."""
     return {
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
-        "default_search": "ytsearch",   # Search YouTube if given a bare title
+        "default_search": "ytsearch",
         "noplaylist": True,
     }
 
 
-def get_audio_url(query: str) -> tuple[str, str]:
-    """
-    Resolve *query* (title or direct URL) to a streamable audio URL.
+def _fmt_duration(secs: int) -> str:
+    """Convert seconds to m:ss string."""
+    m, s = divmod(max(0, int(secs)), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
-    Returns (stream_url, title).
-    Raises RuntimeError if no result is found.
+
+def get_audio_info(query: str) -> TrackInfo:
+    """
+    Resolve *query* (title or direct URL) via yt-dlp.
+
+    Returns a TrackInfo dict: url, title, duration (m:ss), thumbnail URL.
+    Raises RuntimeError if nothing is found.
     """
     with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(query, download=False)
-
-        # Handle search results (list)
         if "entries" in info:
             info = info["entries"][0]
 
         url: str = info.get("url") or info.get("webpage_url", "")
-        title: str = info.get("title", query)
-
         if not url:
-            raise RuntimeError(f"Could not resolve audio URL for: {query}")
+            raise RuntimeError(f"Could not resolve audio URL for: {query!r}")
 
-        return url, title
+        return TrackInfo(
+            url=url,
+            title=info.get("title", query),
+            duration=_fmt_duration(info.get("duration") or 0),
+            thumbnail=info.get("thumbnail", ""),
+        )
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
 
-async def play(chat_id: int, query: str) -> str:
+async def play(chat_id: int, track: TrackInfo) -> bool:
     """
-    Resolve *query*, join the voice chat if needed, and start streaming.
+    Join the voice chat and start streaming *track*.
+    If already playing, enqueue the track instead.
 
-    Returns the track title on success.
-    Raises on failure.
+    Returns True if playback started, False if queued.
+    Raises if the assistant or PyTgCalls is not available.
     """
-    stream_url, title = await asyncio.to_thread(get_audio_url, query)
+    if call_py is None:
+        raise RuntimeError("Music assistant is not configured.")
+
+    await ensure_pytgcalls_started()
+
     state = _get_state(chat_id)
 
     if state["playing"]:
-        # Enqueue instead of interrupting
-        state["queue"].append((stream_url, title))
-        return f"⏭ Added to queue: **{title}**"
+        state["queue"].append(track)
+        logger.info("Queued: %s in chat %s", track["title"], chat_id)
+        return False  # queued
 
+    state["current"] = track
     state["playing"] = True
+    state["paused"] = False
+
     await call_py.join_group_call(
         chat_id,
-        AudioPiped(stream_url, HighQualityAudio()),
-        stream_type=None,
+        AudioPiped(track["url"], HighQualityAudio()),
     )
-    return title
+    logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
+    return True
 
 
 async def stop(chat_id: int) -> None:
-    """Stop playback and leave the voice chat."""
+    """Stop playback, clear the queue, and leave the voice chat."""
     state = _get_state(chat_id)
     state["playing"] = False
+    state["paused"] = False
     state["queue"].clear()
-    try:
-        await call_py.leave_group_call(chat_id)
-    except Exception as exc:
-        logger.warning("stop: leave_group_call raised %s", exc)
+    state["current"] = None
+    if call_py is not None:
+        try:
+            await call_py.leave_group_call(chat_id)
+        except Exception as exc:
+            logger.warning("stop: leave_group_call raised %s", exc)
 
 
 async def pause(chat_id: int) -> None:
     """Pause the current stream."""
-    await call_py.pause_stream(chat_id)
+    state = _get_state(chat_id)
+    if call_py is not None and state["playing"] and not state["paused"]:
+        await call_py.pause_stream(chat_id)
+        state["paused"] = True
 
 
 async def resume(chat_id: int) -> None:
     """Resume a paused stream."""
-    await call_py.resume_stream(chat_id)
+    state = _get_state(chat_id)
+    if call_py is not None and state["playing"] and state["paused"]:
+        await call_py.resume_stream(chat_id)
+        state["paused"] = False
 
 
-async def skip(chat_id: int) -> str | None:
+async def skip(chat_id: int) -> TrackInfo | None:
     """
-    Skip the current track and play the next one in the queue.
-
-    Returns the next track title, or None if the queue was empty.
+    Skip the current track.
+    If the queue has a next track, start it and return its info.
+    Otherwise stop and return None.
     """
     state = _get_state(chat_id)
+
     if not state["queue"]:
         await stop(chat_id)
         return None
 
-    next_url, next_title = state["queue"].pop(0)
-    await call_py.change_stream(
-        chat_id,
-        AudioPiped(next_url, HighQualityAudio()),
-    )
-    return next_title
+    next_track = state["queue"].pop(0)
+    state["current"] = next_track
+    state["paused"] = False
+
+    if call_py is not None:
+        await call_py.change_stream(
+            chat_id,
+            AudioPiped(next_track["url"], HighQualityAudio()),
+        )
+    logger.info("Skipped to: %s in chat %s", next_track["title"], chat_id)
+    return next_track
+
+
+async def toggle_repeat(chat_id: int) -> bool:
+    """Toggle repeat mode. Returns the new repeat state (True = on)."""
+    state = _get_state(chat_id)
+    state["repeat"] = not state["repeat"]
+    logger.info("Repeat %s in chat %s", "ON" if state["repeat"] else "OFF", chat_id)
+    return state["repeat"]
+
+
+def is_playing(chat_id: int) -> bool:
+    return _get_state(chat_id)["playing"]
+
+
+def is_paused(chat_id: int) -> bool:
+    return _get_state(chat_id)["paused"]
+
+
+def is_repeat(chat_id: int) -> bool:
+    return _get_state(chat_id)["repeat"]
+
+
+def current_track(chat_id: int) -> TrackInfo | None:
+    return _get_state(chat_id)["current"]
 
 
 # ─── pytgcalls event: stream ended ────────────────────────────────────────────
 
-@call_py.on_stream_end()
-async def on_stream_end(client: PyTgCalls, update: Update) -> None:
-    """
-    Automatically play the next queued track when a stream finishes,
-    or mark the chat as idle if the queue is empty.
-    """
-    chat_id = update.chat_id
-    state = _get_state(chat_id)
+if call_py is not None:
+    @call_py.on_stream_end()
+    async def _on_stream_end(client, update) -> None:  # type: ignore[misc]
+        """
+        Called by pytgcalls when the current stream finishes.
+        Handles repeat mode and auto-play of the next queued track.
+        """
+        try:
+            chat_id: int = update.chat_id
+        except AttributeError:
+            return
 
-    if state["queue"]:
-        next_url, next_title = state["queue"].pop(0)
-        logger.info("Auto-playing next track in %s: %s", chat_id, next_title)
-        await call_py.change_stream(
-            chat_id,
-            AudioPiped(next_url, HighQualityAudio()),
-        )
-    else:
-        logger.info("Queue empty in %s — leaving voice chat", chat_id)
+        state = _get_state(chat_id)
+
+        # Repeat: replay the current track
+        if state["repeat"] and state["current"]:
+            track = state["current"]
+            logger.info("Repeating: %s in chat %s", track["title"], chat_id)
+            try:
+                await call_py.change_stream(
+                    chat_id,
+                    AudioPiped(track["url"], HighQualityAudio()),
+                )
+            except Exception as exc:
+                logger.warning("Repeat stream failed: %s", exc)
+            return
+
+        # Next in queue
+        if state["queue"]:
+            next_track = state["queue"].pop(0)
+            state["current"] = next_track
+            state["paused"] = False
+            logger.info("Auto-playing next: %s in chat %s", next_track["title"], chat_id)
+            try:
+                await call_py.change_stream(
+                    chat_id,
+                    AudioPiped(next_track["url"], HighQualityAudio()),
+                )
+            except Exception as exc:
+                logger.warning("Auto-play next failed: %s", exc)
+            return
+
+        # Queue empty — leave
+        logger.info("Queue empty in chat %s — leaving voice chat", chat_id)
         state["playing"] = False
+        state["paused"] = False
+        state["current"] = None
         try:
             await call_py.leave_group_call(chat_id)
         except Exception as exc:

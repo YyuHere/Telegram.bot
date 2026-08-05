@@ -23,6 +23,7 @@ import db
 from assistant.userbot import assistant as _assistant
 from handlers import general, ludo, moderation, replies
 from music import commands as music_commands
+from music import player as music_player
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,6 +51,9 @@ async def _startup(app: Application) -> None:
             logger.info("Pyrogram assistant started — logged in as @%s", me.username)
         except Exception as exc:
             logger.warning("Could not start Pyrogram assistant: %s", exc)
+
+    # ── Start PyTgCalls (music streaming) ─────────────────────────────────────
+    await music_player.ensure_pytgcalls_started()
 
     # ── Sync known chats ───────────────────────────────────────────────────────
     chats = db.known_chats()
