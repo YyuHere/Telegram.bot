@@ -38,22 +38,49 @@ async def _startup(app: Application) -> None:
     """
     Runs once after the bot connects, before polling starts.
 
-    1. Starts the Pyrogram assistant userbot (if credentials are configured).
-    2. Syncs members for every chat already known in the DB — using the full
-       Pyrogram get_chat_members() when the assistant is available, or falling
-       back to the admin list via Bot API.
+    Startup order matters:
+    ──────────────────────
+    py-tgcalls 0.9.x owns the Pyrogram client lifecycle.  ``call_py.start()``
+    starts both the pytgcalls engine *and* the underlying Pyrogram session.
+    Calling ``_assistant.start()`` separately beforehand causes a double-start
+    error ("Client is already started") that leaves the session in an
+    inconsistent / disconnected state.
+
+    Therefore:
+      1. ``ensure_pytgcalls_started()`` → ``call_py.start()`` — starts Pyrogram
+         AND pytgcalls in one shot.
+      2. Only when call_py is None (pytgcalls unavailable) do we fall back to
+         starting the Pyrogram client on its own (for member scanning only).
+      3. We verify the session is live with ``_assistant.is_connected`` before
+         using it anywhere.
     """
-    # ── Start Pyrogram assistant ───────────────────────────────────────────────
-    if _assistant is not None:
+    # ── Start PyTgCalls (also boots the Pyrogram assistant inside) ────────────
+    await music_player.ensure_pytgcalls_started()
+
+    # ── Fallback: no pytgcalls, but still need assistant for member scanning ──
+    # Only executed when pytgcalls is unavailable (session string missing,
+    # tgcalls native lib not installed, etc.).  In the normal path call_py.start()
+    # already started the assistant above, so we must not call .start() again.
+    if music_player.call_py is None and _assistant is not None:
         try:
             await _assistant.start()
-            me = await _assistant.get_me()
-            logger.info("Pyrogram assistant started — logged in as @%s", me.username)
+            logger.info("Pyrogram assistant started (member-scan mode, no pytgcalls).")
         except Exception as exc:
             logger.warning("Could not start Pyrogram assistant: %s", exc)
 
-    # ── Start PyTgCalls (music streaming) ─────────────────────────────────────
-    await music_player.ensure_pytgcalls_started()
+    # ── Confirm the session is live ───────────────────────────────────────────
+    if _assistant is not None and _assistant.is_connected:
+        try:
+            me = await _assistant.get_me()
+            logger.info("Pyrogram assistant ready — logged in as @%s (id=%s)", me.username, me.id)
+        except Exception as exc:
+            logger.warning("assistant.get_me() failed despite is_connected=True: %s", exc)
+    elif _assistant is not None:
+        logger.warning(
+            "Pyrogram assistant was configured but is NOT connected after startup. "
+            "Voice chat streaming and full member sync will be unavailable. "
+            "Check ASSISTANT_SESSION_STRING, API_ID, and API_HASH."
+        )
 
     # ── Sync known chats ───────────────────────────────────────────────────────
     chats = db.known_chats()
