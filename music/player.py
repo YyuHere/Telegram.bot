@@ -409,14 +409,34 @@ _NO_CALL_KEYWORDS = (
 )
 
 
+async def _warm_peer_cache(chat_id: int) -> None:
+    """
+    Ensure the Pyrogram assistant has fetched and cached the peer for *chat_id*
+    before any raw API call or pytgcalls operation.
+
+    Pyrogram's resolve_peer() looks up a local cache; if the assistant has
+    never interacted with the chat the cache is empty and resolve_peer() raises
+    "Peer id invalid".  Calling get_chat() first populates that cache.
+
+    Safe to call repeatedly — subsequent calls hit Pyrogram's local cache.
+    """
+    if assistant is None:
+        return
+    try:
+        await assistant.get_chat(chat_id)
+    except Exception as exc:
+        # Non-fatal: log and continue; resolve_peer may still succeed if the
+        # chat was cached by an earlier interaction.
+        logger.debug("_warm_peer_cache(%s): get_chat raised %s", chat_id, exc)
+
+
 async def _create_voice_chat(chat_id: int) -> None:
     """
-    Start a new Telegram Voice Chat in *chat_id* using the Pyrogram assistant's
+    Start a new Telegram Voice Chat in *chat_id* via the Pyrogram assistant's
     raw MTProto API (phone.CreateGroupCall).
 
-    This is necessary because py-tgcalls cannot join a call that does not yet
-    exist — the assistant must create it first.  Silently ignores
-    GROUPCALL_ALREADY_STARTED so callers don't need to pre-check.
+    py-tgcalls cannot join a call that does not yet exist, so the assistant
+    must create it first.  GROUPCALL_ALREADY_STARTED is silently ignored.
     """
     if assistant is None:
         raise RuntimeError(
@@ -427,6 +447,10 @@ async def _create_voice_chat(chat_id: int) -> None:
     import random
     from pyrogram.raw.functions.phone import CreateGroupCall
 
+    # Warm the peer cache before calling resolve_peer() to avoid
+    # "Peer id invalid" errors on chats the assistant hasn't seen yet.
+    await _warm_peer_cache(chat_id)
+
     try:
         peer = await assistant.resolve_peer(chat_id)
         await assistant.invoke(
@@ -435,57 +459,62 @@ async def _create_voice_chat(chat_id: int) -> None:
                 random_id=random.randint(1, 2 ** 31 - 1),
             )
         )
-        logger.info("Voice chat created in chat %s — waiting for Telegram to activate it.", chat_id)
-        # Give Telegram ~1.5 s to activate the call before we try to join.
+        logger.info(
+            "Voice chat created in chat %s — waiting 1.5 s for Telegram to activate it.",
+            chat_id,
+        )
         await asyncio.sleep(1.5)
     except Exception as exc:
         err = str(exc).lower()
         if "already_started" in err or "already started" in err:
-            # Call already exists — nothing to do, join will work.
             logger.debug("_create_voice_chat: call already active in chat %s", chat_id)
         else:
-            # Surface unexpected errors so they appear in logs.
             logger.warning("_create_voice_chat failed for chat %s: %s", chat_id, exc)
             raise
 
 
 async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     """
-    Call ``call_py.join_group_call()``, and if Telegram reports no active voice
-    chat, automatically create one via ``_create_voice_chat()`` and retry once.
+    Join the voice chat for *chat_id*, auto-creating it if none is active.
 
-    This makes ``/play`` work seamlessly even when no admin has manually opened
-    a Voice Chat in the group.
+    Flow:
+      1. Warm the assistant's peer cache so resolve_peer() never fails with
+         "Peer id invalid".
+      2. Call join_group_call().
+      3. If Telegram says no active call exists, create one and retry once.
     """
+    # Warm cache first — prevents "Peer id invalid" inside pytgcalls internals.
+    await _warm_peer_cache(chat_id)
+
     try:
         await call_py.join_group_call(chat_id, stream)
     except Exception as exc:
         err = str(exc).lower()
         if not any(kw in err for kw in _NO_CALL_KEYWORDS):
-            raise  # unrelated error — don't swallow it
+            raise  # unrelated error — re-raise unchanged
 
         logger.info(
             "No active voice chat in chat %s (%s) — creating one and retrying.",
             chat_id, exc,
         )
         await _create_voice_chat(chat_id)
-        # One retry after the call is created.
         await call_py.join_group_call(chat_id, stream)
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
 
-async def play(chat_id: int, track: TrackInfo) -> bool:
+async def play(chat_id: int, track: TrackInfo) -> None:
     """
-    Join the voice chat and start streaming *track*.
-    If already playing, enqueue the track instead.
+    Start streaming *track* in the group voice chat immediately.
 
-    Returns True if playback started, False if queued.
-    Raises if the assistant or PyTgCalls is not available.
+    Behaviour mirrors professional Telegram music bots (X-Music, etc.):
+      • Nothing playing  → join the call and start the track.
+      • Already playing  → replace the current stream instantly via
+                           change_stream(); the queue is cleared so the new
+                           track takes full control.
 
-    Voice chat auto-creation: if no voice chat is currently open in the group,
-    _join_group_call_with_autocreate() creates one via the Pyrogram assistant
-    before joining, so users never need to open it manually.
+    Use ``enqueue()`` to add a track to the queue without interrupting.
+    Raises RuntimeError if the assistant or PyTgCalls is not available.
     """
     if call_py is None:
         raise RuntimeError("Music assistant is not configured.")
@@ -495,9 +524,14 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
     state = _get_state(chat_id)
 
     if state["playing"]:
-        state["queue"].append(track)
-        logger.info("Queued: %s in chat %s", track["title"], chat_id)
-        return False  # queued
+        # Warm peer cache before change_stream as well.
+        await _warm_peer_cache(chat_id)
+        state["queue"].clear()
+        state["current"] = track
+        state["paused"] = False
+        await call_py.change_stream(chat_id, _make_stream(track["url"]))
+        logger.info("Replaced stream with: %s in chat %s", track["title"], chat_id)
+        return
 
     state["current"] = track
     state["playing"] = True
@@ -505,7 +539,28 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
 
     await _join_group_call_with_autocreate(chat_id, _make_stream(track["url"]))
     logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
-    return True
+
+
+async def enqueue(chat_id: int, track: TrackInfo) -> bool:
+    """
+    Add *track* to the end of the queue without interrupting playback.
+
+    Returns True if the track was queued (something was already playing),
+    or False if nothing was playing and the track started immediately instead.
+    """
+    if call_py is None:
+        raise RuntimeError("Music assistant is not configured.")
+
+    state = _get_state(chat_id)
+
+    if state["playing"]:
+        state["queue"].append(track)
+        logger.info("Queued: %s in chat %s", track["title"], chat_id)
+        return True
+
+    # Nothing is playing — start immediately.
+    await play(chat_id, track)
+    return False
 
 
 async def stop(chat_id: int) -> None:

@@ -41,6 +41,9 @@ _CB_PAUSE  = "m_pause"
 _CB_REPEAT = "m_repeat"
 _CB_SKIP   = "m_skip"
 _CB_STOP   = "m_stop"
+# Queue-add callback: "m_queue_{chat_id}_{b64-encoded track url}"
+# We encode only the URL; title/duration are fetched from current state.
+_CB_QUEUE  = "m_queue"
 
 
 # ─── Keyboard builder ─────────────────────────────────────────────────────────
@@ -75,6 +78,13 @@ def _music_keyboard(chat_id: int, bot_username: str) -> InlineKeyboardMarkup:
     ])
 
 
+# Pending-enqueue store: maps (chat_id, user_id) → TrackInfo
+# Populated just before a "now playing" card is sent so the "Add to Queue"
+# inline button in the *next* play request can reference the resolved track.
+# Structure: { (chat_id, user_id): TrackInfo }
+_pending_enqueue: dict[tuple[int, int], "player.TrackInfo"] = {}
+
+
 # ─── Caption builder ──────────────────────────────────────────────────────────
 
 def _music_caption(title: str, duration: str, user_mention: str) -> str:
@@ -97,85 +107,16 @@ def _mention(user) -> str:
 
 # ─── Core play logic ──────────────────────────────────────────────────────────
 
-async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Shared handler for /play and the Arabic تشغيل trigger.
-    Extracts the query, validates it, searches YouTube, and streams audio.
-    """
-    msg  = update.message
-    text = msg.text or ""
-
-    # Extract query — strip command/trigger word
-    if text.startswith("/play"):
-        # Handle /play@BotUsername form
-        after_cmd = text[len("/play"):].lstrip()
-        if after_cmd.startswith("@"):
-            parts = after_cmd.split(None, 1)
-            query = parts[1].strip() if len(parts) > 1 else ""
-        else:
-            query = after_cmd
-    else:
-        # Arabic trigger: "تشغيل <song name>"
-        query = _AR_PLAY_RE.sub("", text).strip()
-
-    if not query:
-        await msg.reply_text("الرجاء كتابة اسم الاغنيه لتشغيلها")
-        return
-
-    # Check 1: env vars must be present
-    if not config.ASSISTANT_ENABLED:
-        await msg.reply_text(
-            "⚠️ موسيقى الصوت غير متاحة.\n"
-            "يجب ضبط `API_ID` و `API_HASH` و `ASSISTANT_SESSION_STRING` أولاً."
-        )
-        return
-
-    # Check 2: PyTgCalls must have initialised successfully
-    if player.call_py is None:
-        await msg.reply_text(
-            "⚠️ فشل تهيئة محرك الصوت (PyTgCalls).\n"
-            "يرجى مراجعة سجلات الخادم."
-        )
-        return
-
-    # Show searching feedback
-    status = await msg.reply_text("🔍 جاري البحث…")
-
-    # Resolve audio info in a thread (yt-dlp is blocking)
-    try:
-        track = await asyncio.to_thread(player.get_audio_info, query)
-    except Exception as exc:
-        logger.warning("yt-dlp failed for %r: %s", query, exc)
-        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
-        return
-
-    chat_id = msg.chat.id
-    user    = msg.from_user
-
-    # Start streaming or queue
-    try:
-        started = await player.play(chat_id, track)
-    except Exception as exc:
-        logger.error("play() failed in chat %s: %s", chat_id, exc)
-        await status.edit_text(f"❌ فشل تشغيل الصوت: {exc}")
-        return
-
-    await status.delete()
-
-    if not started:
-        # Track was queued, not immediately started
-        await msg.reply_text(
-            f"📥 تمت إضافة الأغنية إلى قائمة الانتظار:\n"
-            f"▶ {track['title']} ({track['duration']})",
-            parse_mode="Markdown",
-        )
-        return
-
-    # Build response message
-    bot_me       = await context.bot.get_me()
-    bot_username = bot_me.username or ""
-    caption      = _music_caption(track["title"], track["duration"], _mention(user))
-    keyboard     = _music_keyboard(chat_id, bot_username)
+async def _send_now_playing(
+    msg,
+    track: "player.TrackInfo",
+    chat_id: int,
+    user,
+    bot_username: str,
+) -> None:
+    """Send the 'now playing' card (photo + caption + keyboard) for *track*."""
+    caption  = _music_caption(track["title"], track["duration"], _mention(user))
+    keyboard = _music_keyboard(chat_id, bot_username)
 
     if track["thumbnail"]:
         try:
@@ -189,8 +130,150 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception as exc:
             logger.debug("Thumbnail send failed, falling back to text: %s", exc)
 
-    # Fallback: text message without photo
     await msg.reply_text(caption, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Shared handler for /play and the Arabic تشغيل trigger.
+
+    Always starts the requested track immediately:
+      • Nothing playing  → join voice chat and start streaming.
+      • Already playing  → replace current track instantly (change_stream),
+                           clear the queue.  Mirrors X-Music / professional bot
+                           behaviour — no silent queuing on /play.
+
+    Users who want to queue without interrupting can use /queue <song>.
+    """
+    msg  = update.message
+    text = msg.text or ""
+
+    # ── Extract query ─────────────────────────────────────────────────────────
+    if text.startswith("/play"):
+        after_cmd = text[len("/play"):].lstrip()
+        if after_cmd.startswith("@"):
+            parts = after_cmd.split(None, 1)
+            query = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            query = after_cmd
+    else:
+        query = _AR_PLAY_RE.sub("", text).strip()
+
+    if not query:
+        await msg.reply_text("الرجاء كتابة اسم الاغنيه لتشغيلها")
+        return
+
+    # ── Pre-flight checks ─────────────────────────────────────────────────────
+    if not config.ASSISTANT_ENABLED:
+        await msg.reply_text(
+            "⚠️ موسيقى الصوت غير متاحة.\n"
+            "يجب ضبط `API_ID` و `API_HASH` و `ASSISTANT_SESSION_STRING` أولاً."
+        )
+        return
+
+    if player.call_py is None:
+        await msg.reply_text(
+            "⚠️ فشل تهيئة محرك الصوت (PyTgCalls).\n"
+            "يرجى مراجعة سجلات الخادم."
+        )
+        return
+
+    status = await msg.reply_text("🔍 جاري البحث…")
+
+    # ── Resolve audio (blocking — run in thread) ──────────────────────────────
+    try:
+        track = await asyncio.to_thread(player.get_audio_info, query)
+    except Exception as exc:
+        logger.warning("yt-dlp failed for %r: %s", query, exc)
+        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
+        return
+
+    chat_id = msg.chat.id
+    user    = msg.from_user
+
+    # ── Play immediately (replace if already streaming) ───────────────────────
+    try:
+        await player.play(chat_id, track)
+    except Exception as exc:
+        logger.error("play() failed in chat %s: %s", chat_id, exc)
+        await status.edit_text(f"❌ فشل تشغيل الصوت: {exc}")
+        return
+
+    await status.delete()
+
+    bot_me       = await context.bot.get_me()
+    bot_username = bot_me.username or ""
+    await _send_now_playing(msg, track, chat_id, user, bot_username)
+
+
+async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /queue <song> — add a track to the end of the queue without interrupting
+    whatever is currently playing.  If nothing is playing, starts immediately.
+    """
+    msg  = update.message
+    text = msg.text or ""
+
+    # Strip "/queue" or "/queue@BotName"
+    after_cmd = text.split(None, 1)
+    query = after_cmd[1].strip() if len(after_cmd) > 1 else ""
+
+    # Strip bot-username suffix from the command word itself if present
+    if query.startswith("@"):
+        parts = query.split(None, 1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+
+    if not query:
+        await msg.reply_text("الرجاء كتابة اسم الاغنية لإضافتها إلى قائمة الانتظار")
+        return
+
+    if not config.ASSISTANT_ENABLED:
+        await msg.reply_text(
+            "⚠️ موسيقى الصوت غير متاحة.\n"
+            "يجب ضبط `API_ID` و `API_HASH` و `ASSISTANT_SESSION_STRING` أولاً."
+        )
+        return
+
+    if player.call_py is None:
+        await msg.reply_text(
+            "⚠️ فشل تهيئة محرك الصوت (PyTgCalls).\n"
+            "يرجى مراجعة سجلات الخادم."
+        )
+        return
+
+    status = await msg.reply_text("🔍 جاري البحث للإضافة إلى قائمة الانتظار…")
+
+    try:
+        track = await asyncio.to_thread(player.get_audio_info, query)
+    except Exception as exc:
+        logger.warning("yt-dlp (queue) failed for %r: %s", query, exc)
+        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
+        return
+
+    chat_id = msg.chat.id
+    user    = msg.from_user
+
+    try:
+        was_queued = await player.enqueue(chat_id, track)
+    except Exception as exc:
+        logger.error("enqueue() failed in chat %s: %s", chat_id, exc)
+        await status.edit_text(f"❌ فشل الإضافة: {exc}")
+        return
+
+    await status.delete()
+
+    if was_queued:
+        queue_len = len(player._get_state(chat_id)["queue"])
+        await msg.reply_text(
+            f"📥 تمت إضافة الأغنية إلى قائمة الانتظار (#{queue_len}):\n"
+            f"▶ *{track['title']}* ({track['duration']})",
+            parse_mode="Markdown",
+        )
+    else:
+        # Nothing was playing — started immediately
+        bot_me       = await context.bot.get_me()
+        bot_username = bot_me.username or ""
+        await _send_now_playing(msg, track, chat_id, user, bot_username)
 
 
 # ─── Callback helpers ─────────────────────────────────────────────────────────
@@ -288,13 +371,16 @@ async def _cb_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def register(app: Application) -> None:
     """Attach music command and callback handlers to the application."""
 
-    # /play command — groups only
+    # /play — always plays immediately (replaces current track), groups only
     app.add_handler(CommandHandler("play", _handle_play, filters=_GROUP_FILTER))
 
     # Arabic "تشغيل" trigger — groups only
     app.add_handler(
         MessageHandler(_GROUP_FILTER & _AR_PLAY_FILTER, _handle_play)
     )
+
+    # /queue — add to queue without interrupting current track, groups only
+    app.add_handler(CommandHandler("queue", _handle_queue, filters=_GROUP_FILTER))
 
     # Playback control callbacks
     app.add_handler(CallbackQueryHandler(_cb_play,   pattern=rf"^{_CB_PLAY}_-?\d+$"))
