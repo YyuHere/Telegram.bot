@@ -495,156 +495,174 @@ def set_bot(bot) -> None:
 
 async def _ensure_assistant_in_chat(chat_id: int) -> bool:
     """
-    Guarantee the Pyrogram assistant is a member of *chat_id* AND that
+    Guarantee @HelpQaed (id=7769827870) is a member of *chat_id* AND that
     the chat peer is resolved in Pyrogram's internal MTProto cache.
 
     Why this matters
     ----------------
-    Pyrogram needs an ``InputPeer`` object (fetched once and cached locally)
-    before it can make any MTProto call for a chat.  If the assistant's session
-    has never seen this chat, even a bare ``get_chat(chat_id)`` raises
-    "Peer id invalid" — a chicken-and-egg problem.  ``resolve_peer()`` is the
-    canonical way to check whether the cache entry exists.
+    Pyrogram needs an ``InputPeer`` object cached locally before it can make
+    any MTProto call for a chat.  If the assistant's session has never seen
+    this chat, even ``get_chat(chat_id)`` raises "Peer id invalid".
+    ``resolve_peer()`` is the canonical check for whether the cache entry exists.
 
-    Strategies (tried in order, stops at first success)
-    ---------------------------------------------------
-    0. ``resolve_peer(chat_id)``      — instant success when the peer is
-                                        already cached (common after the first
-                                        successful join).
-    1. ``join_chat("@username")``     — public groups; username fetched from
-                                        the PTB bot so we avoid the bare-id
-                                        chicken-and-egg problem.
-    2. ``join_chat(invite_link)``     — private groups with an exported link.
-    3. ``join_chat(chat_id)``         — last-resort bare-id join; works when
-                                        the assistant is already a member but
-                                        the session cache is cold (e.g. restart).
-    4. ``ptb_bot.add_chat_member()``  — main bot (admin) adds the assistant
-                                        directly; then poll ``resolve_peer()``
-                                        until the MTProto update warms the cache.
+    Flow
+    ----
+    1. Pyrogram fast-path  — ``resolve_peer()`` succeeds → already ready.
+    2. PTB membership check — ``get_chat_member(chat_id, ASSISTANT_USER_ID)``
+                              confirms current membership status without needing
+                              the Pyrogram cache at all.
+    3a. If NOT a member    — self-join via group username / invite link / bare id,
+                              then bot-invite as the final fallback, always using
+                              the hardcoded id so no ``get_me()`` call is needed.
+    3b. If already a member but cache is cold — skip join steps, go straight to
+                              cache-warm polling.
+    4. Cache-warm poll     — ``resolve_peer()`` retried every second for up to
+                              6 s while Pyrogram processes the membership update.
 
-    Returns True when the assistant is confirmed ready, False when every
-    strategy failed (the caller should surface a clear error to the user).
+    Returns True when the assistant is confirmed ready; False when every
+    strategy failed (the caller will surface a clear error to the user).
     """
     if assistant is None:
         return False
 
+    import config as _config
+
     # ── Fast path: peer already in Pyrogram's local cache ────────────────────
     try:
         await assistant.resolve_peer(chat_id)
-        logger.debug("_ensure_assistant_in_chat(%s): peer already resolved ✓", chat_id)
+        logger.debug(
+            "_ensure_assistant_in_chat(%s): @%s peer already resolved ✓",
+            chat_id, _config.ASSISTANT_USERNAME,
+        )
         return True
     except Exception:
         pass
 
     logger.info(
-        "_ensure_assistant_in_chat(%s): peer not in cache — fetching chat info to join",
-        chat_id,
+        "_ensure_assistant_in_chat(%s): @%s peer not cached — checking membership",
+        chat_id, _config.ASSISTANT_USERNAME,
     )
 
-    # ── Fetch username / invite link via PTB bot ──────────────────────────────
-    username: str | None = None
-    invite_link: str | None = None
-
+    # ── PTB membership check (no Pyrogram cache needed) ──────────────────────
+    already_member = False
     if _ptb_bot is not None:
         try:
-            ptb_chat = await _ptb_bot.get_chat(chat_id)
-            username    = getattr(ptb_chat, "username",    None)
-            invite_link = getattr(ptb_chat, "invite_link", None)
-            logger.debug(
-                "_ensure_assistant_in_chat(%s): username=%r invite_link=%s",
-                chat_id, username, bool(invite_link),
-            )
-        except Exception as exc:
-            logger.debug(
-                "_ensure_assistant_in_chat(%s): ptb get_chat failed: %s", chat_id, exc
-            )
-
-    # ── Strategy 1: join via @username (public groups) ────────────────────────
-    if username:
-        try:
-            await assistant.join_chat(f"@{username.lstrip('@')}")
-            logger.info("Assistant joined chat %s via @%s", chat_id, username)
-            await asyncio.sleep(1.5)
-            await assistant.resolve_peer(chat_id)
-            return True
-        except Exception as exc:
-            logger.debug(
-                "_ensure_assistant_in_chat(%s): join_chat by username failed: %s",
-                chat_id, exc,
-            )
-
-    # ── Strategy 2: join via invite link (private groups) ────────────────────
-    if invite_link:
-        try:
-            await assistant.join_chat(invite_link)
-            logger.info("Assistant joined chat %s via invite link", chat_id)
-            await asyncio.sleep(1.5)
-            await assistant.resolve_peer(chat_id)
-            return True
-        except Exception as exc:
-            logger.debug(
-                "_ensure_assistant_in_chat(%s): join_chat by invite link failed: %s",
-                chat_id, exc,
-            )
-
-    # ── Strategy 3: join via bare int id (cold-cache on existing membership) ──
-    try:
-        await assistant.join_chat(chat_id)
-        logger.info("Assistant joined chat %s via bare id", chat_id)
-        await asyncio.sleep(1.5)
-        await assistant.resolve_peer(chat_id)
-        return True
-    except Exception as exc:
-        logger.debug(
-            "_ensure_assistant_in_chat(%s): join_chat by bare id failed: %s",
-            chat_id, exc,
-        )
-
-    # ── Strategy 4: main-bot invite + cache poll ──────────────────────────────
-    if _ptb_bot is not None:
-        try:
-            me = await assistant.get_me()
-            await _ptb_bot.add_chat_member(chat_id=chat_id, user_id=me.id)
-            logger.info(
-                "Main bot invited assistant (id=%s) to chat %s", me.id, chat_id
-            )
-        except Exception as exc:
-            err_lower = str(exc).lower()
-            if "already" in err_lower or "member" in err_lower:
-                # Already a member — just the cache is cold.  Keep polling.
-                logger.debug(
-                    "_ensure_assistant_in_chat(%s): already a member (cold cache)", chat_id
-                )
-            else:
-                logger.warning(
-                    "_ensure_assistant_in_chat(%s): add_chat_member failed: %s",
-                    chat_id, exc,
-                )
-
-        # Poll resolve_peer — the MTProto membership update can take several
-        # seconds to arrive and warm the session's peer cache.
-        for attempt in range(6):
-            await asyncio.sleep(1.0)
-            try:
-                await assistant.resolve_peer(chat_id)
+            cm = await _ptb_bot.get_chat_member(chat_id, _config.ASSISTANT_USER_ID)
+            status = str(cm.status).lower()
+            if "left" not in status and "kicked" not in status and "banned" not in status:
+                already_member = True
                 logger.info(
-                    "Peer %s resolved after bot invite (attempt %d/6)",
-                    chat_id, attempt + 1,
+                    "_ensure_assistant_in_chat(%s): @%s already a member (status=%s) — warming cache",
+                    chat_id, _config.ASSISTANT_USERNAME, cm.status,
                 )
-                return True
-            except Exception:
-                pass
+        except Exception as exc:
+            logger.debug(
+                "_ensure_assistant_in_chat(%s): PTB membership check failed: %s",
+                chat_id, exc,
+            )
 
-        logger.warning(
-            "_ensure_assistant_in_chat(%s): peer still unresolvable after invite + 6 s",
-            chat_id,
-        )
-        return False
+    # ── Join strategies (skipped when already a member) ───────────────────────
+    if not already_member:
+        # Fetch group username / invite link so we can join without needing a
+        # pre-cached peer (avoids the chicken-and-egg bare-id problem).
+        group_username: str | None = None
+        invite_link: str | None = None
+        if _ptb_bot is not None:
+            try:
+                ptb_chat   = await _ptb_bot.get_chat(chat_id)
+                group_username = getattr(ptb_chat, "username",    None)
+                invite_link    = getattr(ptb_chat, "invite_link", None)
+                logger.debug(
+                    "_ensure_assistant_in_chat(%s): group_username=%r invite_link=%s",
+                    chat_id, group_username, bool(invite_link),
+                )
+            except Exception as exc:
+                logger.debug("PTB get_chat(%s) failed: %s", chat_id, exc)
+
+        # Strategy A: assistant self-joins via group @username (public groups)
+        if group_username:
+            try:
+                await assistant.join_chat(f"@{group_username.lstrip('@')}")
+                logger.info(
+                    "@%s joined chat %s via group @%s",
+                    _config.ASSISTANT_USERNAME, chat_id, group_username,
+                )
+                await asyncio.sleep(1.5)
+                await assistant.resolve_peer(chat_id)
+                return True
+            except Exception as exc:
+                logger.debug("join_chat by group username failed for %s: %s", chat_id, exc)
+
+        # Strategy B: assistant self-joins via invite link (private groups)
+        if invite_link:
+            try:
+                await assistant.join_chat(invite_link)
+                logger.info(
+                    "@%s joined chat %s via invite link",
+                    _config.ASSISTANT_USERNAME, chat_id,
+                )
+                await asyncio.sleep(1.5)
+                await assistant.resolve_peer(chat_id)
+                return True
+            except Exception as exc:
+                logger.debug("join_chat by invite link failed for %s: %s", chat_id, exc)
+
+        # Strategy C: bare-id join (works if already a member with cold cache)
+        try:
+            await assistant.join_chat(chat_id)
+            logger.info(
+                "@%s joined chat %s via bare id",
+                _config.ASSISTANT_USERNAME, chat_id,
+            )
+            await asyncio.sleep(1.5)
+            await assistant.resolve_peer(chat_id)
+            return True
+        except Exception as exc:
+            logger.debug("join_chat by bare id failed for %s: %s", chat_id, exc)
+
+        # Strategy D: main bot adds @HelpQaed by hardcoded user ID
+        # (requires bot to be admin with "Add Members" permission)
+        if _ptb_bot is not None:
+            try:
+                await _ptb_bot.add_chat_member(
+                    chat_id=chat_id,
+                    user_id=_config.ASSISTANT_USER_ID,
+                )
+                logger.info(
+                    "Main bot invited @%s (id=%s) to chat %s",
+                    _config.ASSISTANT_USERNAME, _config.ASSISTANT_USER_ID, chat_id,
+                )
+            except Exception as exc:
+                err_lower = str(exc).lower()
+                if "already" in err_lower or "member" in err_lower:
+                    logger.debug(
+                        "@%s already a member of %s (cold Pyrogram cache)",
+                        _config.ASSISTANT_USERNAME, chat_id,
+                    )
+                else:
+                    logger.warning(
+                        "add_chat_member(@%s → chat %s) failed: %s",
+                        _config.ASSISTANT_USERNAME, chat_id, exc,
+                    )
+
+    # ── Cache-warm poll ───────────────────────────────────────────────────────
+    # Whether we just joined or were already a member, Pyrogram may need a
+    # moment to receive the MTProto membership update and cache the peer.
+    for attempt in range(6):
+        await asyncio.sleep(1.0)
+        try:
+            await assistant.resolve_peer(chat_id)
+            logger.info(
+                "Peer %s resolved for @%s (attempt %d/6)",
+                chat_id, _config.ASSISTANT_USERNAME, attempt + 1,
+            )
+            return True
+        except Exception:
+            pass
 
     logger.warning(
-        "_ensure_assistant_in_chat(%s): all strategies exhausted — add the assistant "
-        "account to the group manually and restart the bot.",
-        chat_id,
+        "_ensure_assistant_in_chat(%s): @%s peer still unresolvable after all strategies + 6 s poll",
+        chat_id, _config.ASSISTANT_USERNAME,
     )
     return False
 
@@ -706,10 +724,10 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     ready = await _ensure_assistant_in_chat(chat_id)
     if not ready:
         raise RuntimeError(
-            "⚠️ لم يتمكن الحساب المساعد من الانضمام إلى المجموعة.\n"
-            "• أضف الحساب المساعد إلى المجموعة يدويًا.\n"
-            "• تأكد من أن البوت الرئيسي مسؤول (admin) في المجموعة.\n"
-            "• ثم أعد تشغيل أمر /play."
+            "⚠️ تعذّر على الحساب المساعد @HelpQaed الانضمام إلى المجموعة.\n"
+            "• تأكد من أن البوت الرئيسي مسؤول (admin) في المجموعة وله صلاحية إضافة الأعضاء.\n"
+            "• أو أضف @HelpQaed إلى المجموعة يدويًا.\n"
+            "• ثم أعد المحاولة بأمر /play."
         )
 
     # ── Step 2: first join_group_call attempt ─────────────────────────────────

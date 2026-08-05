@@ -41,10 +41,16 @@ The `Telegram Bot` workflow runs `python main.py` from the root directory.
 Required secrets (add via Replit Secrets):
 - `BOT_TOKEN` — from @BotFather
 
-Optional secrets (enable full member sync via Pyrogram assistant):
+Optional secrets (enable full member sync + voice chat streaming via Pyrogram assistant):
 - `API_ID` — from my.telegram.org/apps
 - `API_HASH` — from my.telegram.org/apps
 - `ASSISTANT_SESSION_STRING` — generate once with `python generate_session.py`
+
+The assistant account used for voice chat streaming is fixed:
+- **User ID**: `7769827870`
+- **Username**: `@HelpQaed`
+- Configured in `config.py` as `ASSISTANT_USER_ID` / `ASSISTANT_USERNAME` (no env var needed)
+- When `/play` is triggered, the bot automatically checks if `@HelpQaed` is in the group and invites it if not (requires the main bot to be admin with "Add Members" permission)
 
 Optional:
 - `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
