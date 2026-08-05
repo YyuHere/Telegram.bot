@@ -5,14 +5,21 @@ python-telegram-bot==21.5
 python-dotenv>=1.0.1
 
 # Pyrogram MTProto client (Assistant userbot + full member scan)
-# pyrogram 2.0.106 is the last stable 2.x release; TgCrypto must match.
-pyrogram==2.0.106
-TgCrypto==1.2.5
+pyrogram>=2.0.106
+tgcrypto
 
-# Voice chat streaming (pytgcalls 3.x dev series targets Pyrogram 2.x)
-# dev24 is the version compatible with the AudioPiped / HighQualityAudio API
-# used throughout music/player.py. Bump alongside pyrogram if you upgrade.
-pytgcalls==3.0.0.dev24
+# Voice chat streaming.
+# py-tgcalls is the actively-maintained successor to pytgcalls 3.x.
+# It provides the same `pytgcalls` Python module but without the unavailable
+# native `tgcalls` binary dependency. Uses MediaStream instead of AudioPiped.
+py-tgcalls
 
 # Audio download / stream URL resolution
-yt-dlp>=2024.4.9
+yt-dlp
+py-tgcalls
+pyrogram>=2.0.106
+python-dotenv
+python-telegram-bot==21.5
+telegram
+tgcrypto
+yt-dlp

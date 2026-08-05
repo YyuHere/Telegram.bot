@@ -32,28 +32,23 @@ _HighQualityAudio = None
 if assistant is not None:
     try:
         from pytgcalls import PyTgCalls
-        from pytgcalls.types.input_stream import AudioPiped as _AudioPiped          # noqa: F401
-        from pytgcalls.types.input_stream.quality import HighQualityAudio as _HighQualityAudio  # noqa: F401
-        AudioPiped = _AudioPiped
-        HighQualityAudio = _HighQualityAudio
+        # py-tgcalls (the maintained successor to pytgcalls 3.x) exposes
+        # MediaStream instead of the old AudioPiped / HighQualityAudio API.
+        from pytgcalls.types import MediaStream
         call_py = PyTgCalls(assistant)
         logger.info("PyTgCalls instance created successfully.")
     except Exception:
-        # Log the full traceback — not just the one-line message — so the exact
-        # failure reason (ImportError, version mismatch, session error, …) is
-        # printed to the server log.
+        # logger.exception() prints the full traceback, not just the message,
+        # so the exact failure reason is visible in the server log.
         logger.exception(
             "Failed to create PyTgCalls instance. "
-            "Check that pytgcalls, pyrogram, and tgcrypto are installed at "
-            "compatible versions, and that the ASSISTANT_SESSION_STRING is valid."
+            "Check that py-tgcalls, pyrogram, and tgcrypto are installed and "
+            "that ASSISTANT_SESSION_STRING is valid."
         )
 else:
-    # Define stubs so the rest of the module can import the names safely even
+    # Stub so the rest of the module can reference MediaStream safely even
     # when the assistant is not configured.
-    class AudioPiped:  # type: ignore[no-redef]
-        def __init__(self, *a, **kw): ...
-
-    class HighQualityAudio:  # type: ignore[no-redef]
+    class MediaStream:  # type: ignore[no-redef]
         def __init__(self, *a, **kw): ...
 
 
@@ -197,7 +192,7 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
 
     await call_py.join_group_call(
         chat_id,
-        AudioPiped(track["url"], HighQualityAudio()),
+        MediaStream(track["url"]),
     )
     logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
     return True
@@ -252,7 +247,7 @@ async def skip(chat_id: int) -> TrackInfo | None:
     if call_py is not None:
         await call_py.change_stream(
             chat_id,
-            AudioPiped(next_track["url"], HighQualityAudio()),
+            MediaStream(next_track["url"]),
         )
     logger.info("Skipped to: %s in chat %s", next_track["title"], chat_id)
     return next_track
@@ -305,7 +300,7 @@ if call_py is not None:
             try:
                 await call_py.change_stream(
                     chat_id,
-                    AudioPiped(track["url"], HighQualityAudio()),
+                    MediaStream(track["url"]),
                 )
             except Exception as exc:
                 logger.warning("Repeat stream failed: %s", exc)
@@ -320,7 +315,7 @@ if call_py is not None:
             try:
                 await call_py.change_stream(
                     chat_id,
-                    AudioPiped(next_track["url"], HighQualityAudio()),
+                    MediaStream(next_track["url"]),
                 )
             except Exception as exc:
                 logger.warning("Auto-play next failed: %s", exc)
