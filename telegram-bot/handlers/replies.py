@@ -143,13 +143,86 @@ async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.debug("Auto-replied in chat %s", msg.chat.id)
 
 
+# ── List replies ──────────────────────────────────────────────────────────────
+
+async def list_replies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    الردود — show all saved triggers for this chat (group-specific + global).
+    Works in groups (any member) and private DMs (bot admin only).
+    """
+    msg  = update.message
+    chat = msg.chat
+
+    if chat.type == "private" and not _is_bot_admin(msg.from_user.id):
+        await msg.reply_text("🚫 هذا الأمر متاح للمسؤول فقط في المحادثات الخاصة.")
+        return
+
+    scope_id = 0 if chat.type == "private" else chat.id
+    pairs    = db.list_replies(scope_id)
+
+    if not pairs:
+        await msg.reply_text("📭 لا توجد ردود محفوظة في هذا الجروب حتى الآن.")
+        return
+
+    lines = ["📜 *الردود المحفوظة:*\n"]
+    for i, (trigger, response) in enumerate(pairs, 1):
+        lines.append(f"{i}\\. `{trigger}` ← {response}")
+
+    await msg.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── Delete reply ───────────────────────────────────────────────────────────────
+
+async def delete_reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    حذف رد [كلمة] — remove a saved trigger.
+    Groups: any member (they can only delete from their group scope).
+    Private DM: bot admin only (deletes from global scope).
+    """
+    msg  = update.message
+    chat = msg.chat
+    text = (msg.text or "").strip()
+
+    if chat.type == "private" and not _is_bot_admin(msg.from_user.id):
+        await msg.reply_text("🚫 هذا الأمر متاح للمسؤول فقط في المحادثات الخاصة.")
+        return
+
+    # Extract the trigger word — everything after "حذف رد"
+    parts   = re.split(r"حذف\s+رد\s*", text, maxsplit=1)
+    trigger = parts[1].strip() if len(parts) > 1 else ""
+
+    if not trigger:
+        await msg.reply_text(
+            "⚠️ اكتب الكلمة المراد حذف ردها\\.\n"
+            "مثال: `حذف رد احمد`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    scope_id = 0 if chat.type == "private" else chat.id
+    removed  = db.delete_reply(scope_id, trigger)
+
+    if removed:
+        await msg.reply_text(f"✅ تم حذف الرد الخاص بكلمة: *{trigger}*", parse_mode="MarkdownV2")
+        logger.info("Deleted reply trigger=%r scope=%s", trigger, scope_id)
+    else:
+        await msg.reply_text(f"❌ لم يتم العثور على رد لكلمة: *{trigger}*", parse_mode="MarkdownV2")
+
+
 # ── Registration ──────────────────────────────────────────────────────────────
+
+_LIST_FILTER   = filters.Regex(re.compile(r"^الردود$"))
+_DELETE_RE     = re.compile(r"^حذف\s+رد\b")
+_DELETE_FILTER = filters.Regex(_DELETE_RE)
+
+_GROUP_AND_PRIVATE = _GROUP_FILTER | _PRIVATE_FILTER
+
 
 def register(app: Application) -> None:
     """Attach the reply conversation handler and the auto-reply listener."""
 
     # ConversationHandler works in both groups and private DMs
-    entry_filter = (_GROUP_FILTER | _PRIVATE_FILTER) & _ADD_REPLY_FILTER
+    entry_filter = _GROUP_AND_PRIVATE & _ADD_REPLY_FILTER
 
     conv = ConversationHandler(
         entry_points=[
@@ -176,12 +249,20 @@ def register(app: Application) -> None:
         # Conversation is per (chat, user) — each user has their own flow
         per_user=True,
         per_chat=True,
-        # Allow the conversation to continue even if other handlers run
+        # Allow the conversation to restart if user sends the trigger again
         allow_reentry=True,
     )
 
     # Priority 0 (default) — ConversationHandler intercepts first
     app.add_handler(conv)
+
+    # List and delete reply commands — groups + private DMs
+    app.add_handler(
+        MessageHandler(_GROUP_AND_PRIVATE & _LIST_FILTER, list_replies_cmd)
+    )
+    app.add_handler(
+        MessageHandler(_GROUP_AND_PRIVATE & _DELETE_FILTER, delete_reply_cmd)
+    )
 
     # Auto-reply runs at group=1 so ConversationHandler (group=0) wins during
     # active flows and the trigger text itself doesn't fire an auto-reply.
