@@ -396,38 +396,117 @@ def get_audio_info(query: str) -> TrackInfo:
 
 # ─── Voice chat lifecycle ─────────────────────────────────────────────────────
 
-# Keywords found in py-tgcalls / Telegram error messages that indicate there
-# is no active group call in the chat (as opposed to auth/network failures).
+# Error substrings that mean there is no active Telegram Voice Chat in the
+# chat (as opposed to auth / network failures).
 _NO_CALL_KEYWORDS = (
     "no active",
-    "not found",
     "groupcall_forbidden",
     "groupcall_invalid",
     "group call",
     "call not found",
-    "chat not found",
 )
 
+# Error substrings that mean the assistant is not a member of the chat at all.
+# pytgcalls surfaces these as generic exceptions whose message contains these
+# fragments when the Pyrogram client doesn't know the peer yet.
+_NOT_MEMBER_KEYWORDS = (
+    "peer id invalid",
+    "peer_id_invalid",
+    "not in a group",
+    "not in the group",
+    "userbot",          # "the userbot there isn't in a group call"
+    "user not participant",
+    "chat not found",
+    "not found",        # covers several Telegram API 400 variants
+)
 
-async def _warm_peer_cache(chat_id: int) -> None:
+# Optional reference to the PTB Application bot, injected from commands.py
+# so the player can ask the main bot to invite the assistant into private chats.
+_ptb_bot = None
+
+
+def set_bot(bot) -> None:
     """
-    Ensure the Pyrogram assistant has fetched and cached the peer for *chat_id*
-    before any raw API call or pytgcalls operation.
+    Store a reference to the python-telegram-bot Bot instance so that
+    _ensure_assistant_in_chat() can use it to invite the assistant into
+    private groups where self-join is not allowed.
 
-    Pyrogram's resolve_peer() looks up a local cache; if the assistant has
-    never interacted with the chat the cache is empty and resolve_peer() raises
-    "Peer id invalid".  Calling get_chat() first populates that cache.
+    Call this once from music/commands.py after the Application is built.
+    """
+    global _ptb_bot
+    _ptb_bot = bot
 
-    Safe to call repeatedly — subsequent calls hit Pyrogram's local cache.
+
+async def _ensure_assistant_in_chat(chat_id: int) -> None:
+    """
+    Guarantee the assistant userbot is a member of *chat_id* before any voice
+    chat operation.  Without membership pytgcalls raises "Peer id invalid" or
+    "The userbot isn't in a group call".
+
+    Strategy (tried in order, stops at first success):
+      1. ``assistant.get_chat()``  — if this succeeds the assistant is already
+         a member; also warms the Pyrogram peer cache as a side-effect.
+      2. ``assistant.join_chat()`` — works for public supergroups/channels and
+         any group where the assistant holds an invite link.
+      3. ``ptb_bot.add_chat_member()`` — for private groups where the main bot
+         is an admin; it adds the assistant directly via the Bot API.
+
+    Non-fatal: if every strategy fails, a warning is logged.  pytgcalls will
+    then surface its own error which gives the caller a chance to catch and
+    report it.
     """
     if assistant is None:
         return
+
+    # ── Step 1: check / warm membership ──────────────────────────────────────
     try:
         await assistant.get_chat(chat_id)
+        logger.debug("_ensure_assistant_in_chat(%s): already a member", chat_id)
+        return
     except Exception as exc:
-        # Non-fatal: log and continue; resolve_peer may still succeed if the
-        # chat was cached by an earlier interaction.
-        logger.debug("_warm_peer_cache(%s): get_chat raised %s", chat_id, exc)
+        logger.debug(
+            "_ensure_assistant_in_chat(%s): get_chat failed (%s) — will try to join",
+            chat_id, exc,
+        )
+
+    # ── Step 2: self-join (public groups, supergroups with invite link) ───────
+    try:
+        await assistant.join_chat(chat_id)
+        logger.info("Assistant joined chat %s via join_chat()", chat_id)
+        # Give Telegram a moment to register the membership before proceeding.
+        await asyncio.sleep(1.0)
+        return
+    except Exception as exc:
+        logger.debug(
+            "_ensure_assistant_in_chat(%s): join_chat failed (%s) — trying bot invite",
+            chat_id, exc,
+        )
+
+    # ── Step 3: bot-invite (private groups where main bot is admin) ───────────
+    if _ptb_bot is not None:
+        try:
+            me = await assistant.get_me()
+            await _ptb_bot.add_chat_member(chat_id=chat_id, user_id=me.id)
+            logger.info("Main bot invited assistant to chat %s", chat_id)
+            await asyncio.sleep(1.0)
+            # Re-warm the peer cache now that the assistant is in the chat.
+            try:
+                await assistant.get_chat(chat_id)
+            except Exception:
+                pass
+            return
+        except Exception as exc:
+            logger.warning(
+                "_ensure_assistant_in_chat(%s): bot invite failed: %s",
+                chat_id, exc,
+            )
+    else:
+        logger.warning(
+            "_ensure_assistant_in_chat(%s): assistant is not in the group and "
+            "no PTB bot reference is available for fallback invite. "
+            "Add the assistant account to the group manually.",
+            chat_id,
+        )
 
 
 async def _create_voice_chat(chat_id: int) -> None:
@@ -437,6 +516,8 @@ async def _create_voice_chat(chat_id: int) -> None:
 
     py-tgcalls cannot join a call that does not yet exist, so the assistant
     must create it first.  GROUPCALL_ALREADY_STARTED is silently ignored.
+    The assistant is guaranteed to be a chat member before this is called
+    (enforced by _join_group_call_with_autocreate).
     """
     if assistant is None:
         raise RuntimeError(
@@ -446,10 +527,6 @@ async def _create_voice_chat(chat_id: int) -> None:
 
     import random
     from pyrogram.raw.functions.phone import CreateGroupCall
-
-    # Warm the peer cache before calling resolve_peer() to avoid
-    # "Peer id invalid" errors on chats the assistant hasn't seen yet.
-    await _warm_peer_cache(chat_id)
 
     try:
         peer = await assistant.resolve_peer(chat_id)
@@ -475,30 +552,50 @@ async def _create_voice_chat(chat_id: int) -> None:
 
 async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     """
-    Join the voice chat for *chat_id*, auto-creating it if none is active.
+    Robustly join the voice chat for *chat_id*, handling every common failure:
 
-    Flow:
-      1. Warm the assistant's peer cache so resolve_peer() never fails with
-         "Peer id invalid".
+      1. Ensure the assistant is a member of the chat (auto-join if not).
       2. Call join_group_call().
-      3. If Telegram says no active call exists, create one and retry once.
+      3. If "not in group" / "peer id invalid" — repeat step 1 and retry.
+      4. If "no active voice chat" — create one and retry.
+
+    All retries happen at most once to avoid infinite loops.
     """
-    # Warm cache first — prevents "Peer id invalid" inside pytgcalls internals.
-    await _warm_peer_cache(chat_id)
+    # ── Guarantee membership before the first attempt ─────────────────────────
+    await _ensure_assistant_in_chat(chat_id)
 
     try:
         await call_py.join_group_call(chat_id, stream)
+        return
     except Exception as exc:
         err = str(exc).lower()
-        if not any(kw in err for kw in _NO_CALL_KEYWORDS):
-            raise  # unrelated error — re-raise unchanged
 
-        logger.info(
-            "No active voice chat in chat %s (%s) — creating one and retrying.",
-            chat_id, exc,
-        )
-        await _create_voice_chat(chat_id)
-        await call_py.join_group_call(chat_id, stream)
+        # ── Membership error after first attempt: re-join and retry ──────────
+        if any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
+            logger.info(
+                "join_group_call(%s) failed with membership error (%s) — "
+                "re-ensuring assistant membership and retrying.",
+                chat_id, exc,
+            )
+            await _ensure_assistant_in_chat(chat_id)
+            try:
+                await call_py.join_group_call(chat_id, stream)
+                return
+            except Exception as exc2:
+                err = str(exc2).lower()
+                exc = exc2  # fall through to the "no call" check below
+
+        # ── No active voice chat: create one and retry ────────────────────────
+        if any(kw in err for kw in _NO_CALL_KEYWORDS):
+            logger.info(
+                "No active voice chat in chat %s (%s) — creating one and retrying.",
+                chat_id, exc,
+            )
+            await _create_voice_chat(chat_id)
+            await call_py.join_group_call(chat_id, stream)
+            return
+
+        raise  # unrelated error — surface it unchanged
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
@@ -524,8 +621,8 @@ async def play(chat_id: int, track: TrackInfo) -> None:
     state = _get_state(chat_id)
 
     if state["playing"]:
-        # Warm peer cache before change_stream as well.
-        await _warm_peer_cache(chat_id)
+        # Ensure membership + warm peer cache before change_stream.
+        await _ensure_assistant_in_chat(chat_id)
         state["queue"].clear()
         state["current"] = track
         state["paused"] = False

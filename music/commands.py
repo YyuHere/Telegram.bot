@@ -371,6 +371,10 @@ async def _cb_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def register(app: Application) -> None:
     """Attach music command and callback handlers to the application."""
 
+    # Give the player a reference to the PTB bot so it can invite the assistant
+    # into private groups when assistant.join_chat() alone is not enough.
+    player.set_bot(app.bot)
+
     # /play — always plays immediately (replaces current track), groups only
     app.add_handler(CommandHandler("play", _handle_play, filters=_GROUP_FILTER))
 
