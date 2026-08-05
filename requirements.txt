@@ -4,12 +4,12 @@ python-telegram-bot==21.5
 # Environment variable loading
 python-dotenv>=1.0.1
 
-# Pyrogram compatible with py-tgcalls
-pyrogram==2.0.97
+# Pyrogram compatible with py-tgcalls 0.9.7
+pyrogram==2.0.106
 tgcrypto
 
-# Voice chat streaming
-py-tgcalls==0.8.6
+# Voice chat streaming (Available version in PyPI list)
+py-tgcalls==0.9.7
 
 # Audio download / stream URL resolution
 yt-dlp
