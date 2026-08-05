@@ -26,53 +26,57 @@ logger = logging.getLogger(__name__)
 # is immediately visible in the server logs instead of surfacing only as the
 # Arabic "فشل تهيئة محرك الصوت" message in Telegram.
 call_py = None
-_AudioPiped = None
-_HighQualityAudio = None
+
 
 def _make_stream(url: str):
     """
-    Build the pytgcalls stream object for *url*, compatible with whichever
-    pytgcalls API version is installed:
-
-      • pytgcalls 0.8.x  →  AudioPiped(url, HighQualityAudio())
-      • py-tgcalls / pytgcalls ≥ 3.x  →  MediaStream(url)
-
-    Resolved once at module load; all playback helpers call _make_stream().
+    Build the pytgcalls stream object for *url* and return it.
+    Delegates to _stream_builder which is resolved once at module load.
     """
     return _stream_builder(url)
 
 
-# ── Resolve the streaming API available in the installed pytgcalls package ──
-
 def _resolve_stream_builder():
     """
-    Detect which pytgcalls streaming constructor is available and return a
-    callable ``url → stream_object``.
+    Return the correct ``url → stream_object`` callable for the installed
+    py-tgcalls version.
 
-    Tries newer MediaStream first (py-tgcalls / pytgcalls ≥ 3.x), then falls
-    back to AudioPiped / HighQualityAudio (pytgcalls 0.8.x).  Either way the
-    full traceback is logged on failure so the exact import error is visible.
+    Detection order (most-specific first to avoid noisy ImportErrors):
+
+      1. AudioPiped / HighQualityAudio  — py-tgcalls 0.9.x (pinned in
+         requirements.txt).  This is the correct API for this project.
+         Pattern: AudioPiped(url, HighQualityAudio())
+
+      2. MediaStream  — py-tgcalls ≥ 3.x / pytgcalls fork.  Tried second so
+         an accidental upgrade is handled gracefully.
+         Pattern: MediaStream(url)
+
+    If neither import succeeds the engine logs a clear error and returns a
+    no-op lambda; callers guard on call_py being None.
     """
+    # ── py-tgcalls 0.9.x  ─────────────────────────────────────────────────────
     try:
-        from pytgcalls.types import MediaStream  # py-tgcalls / 3.x
-        logger.info("pytgcalls: using MediaStream API")
-        return lambda url: MediaStream(url)
-    except ImportError:
-        pass
-
-    try:
-        from pytgcalls.types.input_stream import AudioPiped
-        from pytgcalls.types.input_stream.quality import HighQualityAudio
-        logger.info("pytgcalls: using AudioPiped / HighQualityAudio API (0.8.x)")
+        from pytgcalls.types.input_stream import AudioPiped          # noqa: PLC0415
+        from pytgcalls.types.input_stream.quality import HighQualityAudio  # noqa: PLC0415
+        logger.info("pytgcalls stream API: AudioPiped / HighQualityAudio (py-tgcalls 0.9.x)")
         return lambda url: AudioPiped(url, HighQualityAudio())
     except ImportError:
         pass
 
+    # ── py-tgcalls ≥ 3.x / newer forks  ──────────────────────────────────────
+    try:
+        from pytgcalls.types import MediaStream                       # noqa: PLC0415
+        logger.info("pytgcalls stream API: MediaStream (py-tgcalls ≥ 3.x)")
+        return lambda url: MediaStream(url)
+    except ImportError:
+        pass
+
     logger.error(
-        "pytgcalls: neither MediaStream nor AudioPiped could be imported. "
-        "Check that pytgcalls / py-tgcalls is installed correctly."
+        "pytgcalls stream API: neither AudioPiped nor MediaStream could be "
+        "imported.  Ensure py-tgcalls==0.9.7 (or compatible) and tgcrypto "
+        "are installed correctly."
     )
-    return lambda url: None  # call_py will be None; commands will show error
+    return lambda url: None
 
 
 if assistant is not None:
