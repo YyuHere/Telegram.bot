@@ -1,0 +1,50 @@
+The `@username` or mention detection is still failing for `كتم @username` because string splitting messes up Arabic text and mentions. 
+
+Please replace the entire `extract_user` function with this bulletproof Regex & Pyrogram Entity parser:
+
+```python
+import re
+from pyrogram.enums import MessageEntityType
+
+async def extract_user(client, message):
+    # 1. Reply mode
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+
+    # 2. Extract directly via Pyrogram Message Entities (Most accurate for Telegram Mentions)
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == MessageEntityType.TEXT_MENTION:
+                return entity.user
+            elif entity.type == MessageEntityType.MENTION:
+                user_text = message.text[entity.offset : entity.offset + entity.length].strip()
+                username = user_text.replace("@", "")
+                try:
+                    return await client.get_users(username)
+                except Exception:
+                    async for member in client.get_chat_members(message.chat.id):
+                        if member.user and member.user.username and member.user.username.lower() == username.lower():
+                            return member.user
+
+    # 3. Regex Fallback: extract anything starting with @ or numeric ID anywhere in the text
+    text = message.text or ""
+    # Find @username pattern
+    mention_match = re.search(r'@([a-zA-Z0-9_]+)', text)
+    if mention_match:
+        username = mention_match.group(1)
+        try:
+            return await client.get_users(username)
+        except Exception:
+            async for member in client.get_chat_members(message.chat.id):
+                if member.user and member.user.username and member.user.username.lower() == username.lower():
+                    return member.user
+
+    # Find numeric ID
+    id_match = re.search(r'\b\d{6,15}\b', text)
+    if id_match:
+        try:
+            return await client.get_users(int(id_match.group(0)))
+        except Exception:
+            pass
+
+    return None

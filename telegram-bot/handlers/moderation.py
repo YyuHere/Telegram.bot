@@ -122,29 +122,19 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Priority 2 — Entity scan (TEXT_MENTION + MENTION):
         TEXT_MENTION: Telegram embeds the User object directly — the only
-            reliable way to target users who have no @username set.
-        MENTION: parse_entity() extracts the @username using UTF-16 offsets,
-            immune to Arabic BiDi reordering. Falls back to member cache search
-            if the Bot API can't resolve the username (e.g. privacy settings).
+            reliable path for users who have no @username set.
+        MENTION: parse_entity() reads the UTF-16 offsets Telegram provides,
+            so Arabic characters before @username never corrupt the slice.
+            Falls back to member cache if the Bot API can't resolve the name.
 
-    Priority 3 — Text search after stripping the command word:
-        Remove the trigger (كتم, /mute, بان…) from the raw text, then check
-        the remainder:
-          • @username    → Bot API lookup, then cache fallback
-          • all-digits   → numeric user-ID lookup
-          • anything else → display-name search in the member cache
-            (cache is filled organically by update_member_cache handler)
-        BiDi control characters (U+200B–U+200F, U+202A–U+202E, etc.) are
-        stripped from every token before comparison.
+    Priority 3 — Regex search in raw text:
+        re.search() finds @username or a numeric ID *anywhere* in the string,
+        completely unaffected by Arabic BiDi direction or invisible control
+        chars. No command-word stripping needed — regex skips Arabic naturally.
+          • r'@([a-zA-Z0-9_]+)'  → @username lookup → cache fallback
+          • r'\b\d{6,15}\b'      → numeric user-ID lookup
     """
     msg = update.message
-
-    # Invisible Unicode chars Telegram injects around LTR text in RTL context
-    _BIDI = (
-        "\u200b\u200c\u200d\u200e\u200f"
-        "\u202a\u202b\u202c\u202d\u202e"
-        "\u2066\u2067\u2068\u2069\ufeff"
-    )
 
     # ── Priority 1: reply ─────────────────────────────────────────────────────
     if msg.reply_to_message and msg.reply_to_message.from_user:
@@ -153,70 +143,46 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Priority 2: entity scan ───────────────────────────────────────────────
     for entity in msg.entities or []:
 
-        # TEXT_MENTION — user without @username; Telegram embeds User directly
+        # TEXT_MENTION — user without a @username; User object embedded directly
         if entity.type == "text_mention" and entity.user:
             return entity.user
 
-        # MENTION — @username present in text
+        # MENTION — @username; parse_entity() gives correct UTF-16 slice
         if entity.type == "mention":
-            raw      = msg.parse_entity(entity)            # e.g. "@username"
-            username = raw.lstrip("@").strip(_BIDI).strip()
+            raw      = msg.parse_entity(entity)   # e.g. "@username"
+            username = raw.lstrip("@").strip()
             if not username:
                 continue
             try:
                 return await context.bot.get_chat(f"@{username}")
             except Exception as exc:
-                logger.debug("entity MENTION @%s API failed: %s — trying cache", username, exc)
-                # Fallback: maybe the user is in our member cache
+                logger.debug("entity MENTION @%s failed: %s — trying cache", username, exc)
                 cached = _cache_search_username(msg.chat.id, username)
                 if cached:
                     return cached
 
-    # ── Priority 3: text search after stripping command word ──────────────────
-    # Remove the trigger word / command so what remains is the search query.
-    _COMMANDS = [
-        "الغاء الكتم", "الغاء كتم",
-        "الغاء الحظر", "الغاء بان",
-        "كتم", "بان", "حظر", "طرد",
-        "/unmute", "/unban", "/mute", "/ban", "/kick",
-    ]
-    search_query = (msg.text or "").strip(_BIDI)
-    for cmd in _COMMANDS:
-        if search_query.startswith(cmd):
-            search_query = search_query[len(cmd):].strip(_BIDI).strip()
-            break
+    # ── Priority 3: regex fallback ────────────────────────────────────────────
+    text = msg.text or ""
 
-    if not search_query:
-        return None
-
-    # Strip BiDi chars from the whole query too
-    search_query = search_query.strip(_BIDI).strip()
-
-    # @username
-    if search_query.startswith("@"):
-        username = search_query.lstrip("@").strip(_BIDI).strip()
-        if username:
-            try:
-                return await context.bot.get_chat(f"@{username}")
-            except Exception as exc:
-                logger.debug("text @%s API failed: %s — trying cache", username, exc)
-                cached = _cache_search_username(msg.chat.id, username)
-                if cached:
-                    return cached
-
-    # Numeric user-ID
-    elif search_query.isdigit():
+    # @username anywhere in the message (immune to BiDi / Arabic text around it)
+    mention_match = re.search(r"@([a-zA-Z0-9_]+)", text)
+    if mention_match:
+        username = mention_match.group(1)
         try:
-            return await context.bot.get_chat(int(search_query))
+            return await context.bot.get_chat(f"@{username}")
         except Exception as exc:
-            logger.debug("text user-id %s failed: %s", search_query, exc)
+            logger.debug("regex @%s failed: %s — trying cache", username, exc)
+            cached = _cache_search_username(msg.chat.id, username)
+            if cached:
+                return cached
 
-    # Display-name search in member cache (users without @username)
-    else:
-        found = _cache_search_name(msg.chat.id, search_query)
-        if found:
-            logger.debug("Resolved '%s' via name cache → %s", search_query, found.id)
-            return found
+    # Numeric user-ID (6-15 digits) anywhere in the message
+    id_match = re.search(r"\b(\d{6,15})\b", text)
+    if id_match:
+        try:
+            return await context.bot.get_chat(int(id_match.group(1)))
+        except Exception as exc:
+            logger.debug("regex user-id %s failed: %s", id_match.group(1), exc)
 
     return None
 
