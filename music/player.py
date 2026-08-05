@@ -85,15 +85,23 @@ if assistant is not None:
         # ImportError without changing any runtime behaviour — the exception is
         # used only in a bare `except` clause and is never raised by pyrogram
         # itself in this version.
+        # py-tgcalls/mtproto/pyrogram_client.py does:
+        #   from pyrogram.errors import GroupcallForbidden
+        #   from pyrogram.errors import GroupcallInvalid
+        # pyrogram 2.0.106 removed both (it has GroupCallInvalid with a
+        # capital C instead).  Inject stubs before pytgcalls is first imported
+        # so those module-level imports succeed.  The stubs are only ever used
+        # in `except` clauses inside py-tgcalls — they are never raised by
+        # pyrogram itself, so behaviour is unchanged.
         import pyrogram.errors as _pyr_errors
-        if not hasattr(_pyr_errors, 'GroupcallForbidden'):
-            _pyr_errors.GroupcallForbidden = type(
-                'GroupcallForbidden', (Exception,), {}
-            )
-            logger.debug(
-                "Injected GroupcallForbidden stub into pyrogram.errors "
-                "(missing in pyrogram 2.0.106 but required by py-tgcalls)."
-            )
+        for _missing in ('GroupcallForbidden', 'GroupcallInvalid'):
+            if not hasattr(_pyr_errors, _missing):
+                setattr(_pyr_errors, _missing, type(_missing, (Exception,), {}))
+                logger.debug(
+                    "Injected %s stub into pyrogram.errors "
+                    "(removed in pyrogram 2.0.106, required by py-tgcalls).",
+                    _missing,
+                )
 
         from pytgcalls import PyTgCalls
         _stream_builder = _resolve_stream_builder()
