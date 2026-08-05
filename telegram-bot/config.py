@@ -26,6 +26,11 @@ ASSISTANT_SESSION_STRING: str = os.environ.get("ASSISTANT_SESSION_STRING", "")
 # True only when all three Pyrogram credentials are present
 ASSISTANT_ENABLED: bool = bool(API_ID and API_HASH and ASSISTANT_SESSION_STRING)
 
+# Bot admin user ID — the only user allowed to add replies via private DM.
+# Set BOT_ADMIN_ID in Replit Secrets (integer Telegram user ID).
+_admin_id_raw = os.environ.get("BOT_ADMIN_ID", "")
+BOT_ADMIN_ID: int = int(_admin_id_raw) if _admin_id_raw.isdigit() else 0
+
 
 def validate_config() -> None:
     """Fail fast if BOT_TOKEN is missing."""

@@ -1,15 +1,19 @@
 """
-db.py — SQLite member store for group moderation.
+db.py — SQLite store for group moderation and auto-replies.
 
-Permanently persists group members so the bot can resolve @username
-and display names for users who have NEVER sent a message in the chat.
-
-Table:
-    members(chat_id INTEGER, user_id INTEGER, username TEXT, first_name TEXT)
+Tables
+──────
+members(chat_id, user_id, username, first_name)
+    Permanently persists group members so the bot can resolve @username
+    and display names for users who have NEVER sent a message in the chat.
     PRIMARY KEY (chat_id, user_id)
 
-All writes are upserts — safe to call on every message / join event.
-Queries hit indexed columns, so lookups are sub-millisecond.
+replies(chat_id, trigger, response)
+    Stores trigger→response pairs for the auto-reply system.
+    chat_id = 0  means a *global* reply set by an admin via private DM —
+                 it matches in every group.
+    chat_id = <group_id>  means a reply specific to that group only.
+    PRIMARY KEY (chat_id, trigger)  — one response per trigger per scope.
 """
 
 import sqlite3
@@ -45,6 +49,15 @@ def init_db() -> None:
             ON members (chat_id, LOWER(username));
         CREATE INDEX IF NOT EXISTS idx_members_name
             ON members (chat_id, LOWER(first_name));
+
+        CREATE TABLE IF NOT EXISTS replies (
+            chat_id  INTEGER NOT NULL,
+            trigger  TEXT    NOT NULL,
+            response TEXT    NOT NULL,
+            PRIMARY KEY (chat_id, trigger)
+        );
+        CREATE INDEX IF NOT EXISTS idx_replies_trigger
+            ON replies (chat_id, LOWER(trigger));
     """)
     conn.commit()
     logger.info("DB ready: %s", _DB_PATH)
@@ -100,3 +113,73 @@ def known_chats() -> list[int]:
     """Return all distinct chat_ids stored in the DB (used for startup admin sync)."""
     rows = _get_conn().execute("SELECT DISTINCT chat_id FROM members").fetchall()
     return [int(r["chat_id"]) for r in rows]
+
+
+# ── Replies ────────────────────────────────────────────────────────────────────
+
+def upsert_reply(chat_id: int, trigger: str, response: str) -> None:
+    """
+    Save or overwrite a trigger→response pair for *chat_id*.
+    Use chat_id=0 for global replies (added via private DM by bot admin).
+    """
+    _get_conn().execute(
+        """
+        INSERT INTO replies (chat_id, trigger, response)
+        VALUES (?, ?, ?)
+        ON CONFLICT (chat_id, trigger) DO UPDATE SET
+            response = excluded.response
+        """,
+        (chat_id, trigger, response),
+    )
+    _get_conn().commit()
+
+
+def find_reply(chat_id: int, text: str) -> str | None:
+    """
+    Return the response for the first trigger whose text is found (case-insensitive
+    substring) inside *text*, checking group-specific replies first then global ones.
+
+    Lookup order:
+      1. chat_id = <group_id>  — group-specific replies take priority.
+      2. chat_id = 0           — global replies set by admin via private DM.
+
+    Returns the response string, or None if no trigger matches.
+    """
+    text_lower = text.lower()
+    rows = _get_conn().execute(
+        """
+        SELECT trigger, response
+        FROM   replies
+        WHERE  chat_id IN (?, 0)
+        ORDER BY CASE WHEN chat_id = ? THEN 0 ELSE 1 END
+        """,
+        (chat_id, chat_id),
+    ).fetchall()
+    for row in rows:
+        if row["trigger"].lower() in text_lower:
+            return row["response"]
+    return None
+
+
+def delete_reply(chat_id: int, trigger: str) -> bool:
+    """Delete a reply. Returns True if a row was actually removed."""
+    cur = _get_conn().execute(
+        "DELETE FROM replies WHERE chat_id = ? AND LOWER(trigger) = LOWER(?)",
+        (chat_id, trigger),
+    )
+    _get_conn().commit()
+    return cur.rowcount > 0
+
+
+def list_replies(chat_id: int) -> list[tuple[str, str]]:
+    """Return all (trigger, response) pairs for *chat_id* and global (0)."""
+    rows = _get_conn().execute(
+        """
+        SELECT trigger, response
+        FROM   replies
+        WHERE  chat_id IN (?, 0)
+        ORDER BY chat_id DESC, LOWER(trigger)
+        """,
+        (chat_id,),
+    ).fetchall()
+    return [(r["trigger"], r["response"]) for r in rows]

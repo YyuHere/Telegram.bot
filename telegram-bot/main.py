@@ -17,7 +17,7 @@ from telegram.ext import Application
 import config
 from config import BOT_TOKEN
 import db
-from handlers import general, ludo, moderation
+from handlers import general, ludo, moderation, replies
 from music import commands as music_commands
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -68,6 +68,7 @@ def main() -> None:
     general.register(app)          # /start, /help, /ping
     moderation.register(app)       # /ban /unban /kick /mute /unmute + Arabic triggers
     ludo.register(app)             # Ludo Club code extractor
+    replies.register(app)          # اضافه رد interactive flow + auto-reply
     music_commands.register(app)   # /play etc. — placeholder responses
 
     # 5. Start polling
