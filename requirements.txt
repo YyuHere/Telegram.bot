@@ -8,8 +8,8 @@ python-dotenv>=1.0.1
 pyrogram==2.0.106
 tgcrypto
 
-# Voice chat streaming (Modern PyTgCalls library)
-pytgcalls>=1.2.0
+# Voice chat streaming (Fixed 1.2.0 version without native tgcalls dependencies)
+pytgcalls==1.2.0
 
 # Audio download / stream URL resolution
 yt-dlp
