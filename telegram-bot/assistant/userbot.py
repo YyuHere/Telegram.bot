@@ -4,25 +4,35 @@ assistant/userbot.py — Pyrogram userbot (Assistant) client.
 The Assistant is a real Telegram user account (not a bot) that:
   1. Can be invited to groups by the main bot.
   2. Joins a group's Voice Chat and streams audio via pytgcalls.
+  3. Scans all group members (get_chat_members) for the DB sync command.
 
 The session string is generated once with Pyrogram's StringSession
 and stored in ASSISTANT_SESSION_STRING env var.
+
+Importing this module is safe even without credentials — `assistant`
+will be None and callers must guard with `if assistant is not None`.
 """
 
 import logging
-from pyrogram import Client
-from pyrogram.types import Message
-from config import API_ID, API_HASH, ASSISTANT_SESSION_STRING
+from config import API_ID, API_HASH, ASSISTANT_SESSION_STRING, ASSISTANT_ENABLED
 
 logger = logging.getLogger(__name__)
 
-# Singleton: one Assistant client shared across the whole app
-assistant: Client = Client(
-    name="assistant",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=ASSISTANT_SESSION_STRING,
-)
+# Singleton: one Assistant client shared across the whole app.
+# Only created when all three Pyrogram credentials are present.
+assistant = None
+if ASSISTANT_ENABLED:
+    try:
+        from pyrogram import Client
+        assistant = Client(
+            name="assistant",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=ASSISTANT_SESSION_STRING,
+        )
+        logger.info("Pyrogram assistant client initialised.")
+    except Exception as _exc:
+        logger.warning("Failed to initialise Pyrogram assistant: %s", _exc)
 
 
 async def ensure_in_group(bot: Client, chat_id: int) -> bool:

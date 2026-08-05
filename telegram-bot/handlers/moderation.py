@@ -38,6 +38,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 import db
+from config import ASSISTANT_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -114,12 +115,14 @@ _AR_UNBAN  = re.compile(r"^(الغاء\s+الحظر|الغاء\s+بان)\b")
 _AR_KICK   = re.compile(r"^طرد\b")
 _AR_MUTE   = re.compile(r"^كتم\b")
 _AR_UNMUTE = re.compile(r"^(الغاء\s+الكتم|الغاء\s+كتم)\b")
+_AR_SYNC   = re.compile(r"^تحديث\s+الأعضاء\b")
 
 _AR_MOD_FILTER = filters.Regex(
     re.compile(
         r"^(بان|حظر|الغاء\s+الحظر|الغاء\s+بان|طرد|كتم|الغاء\s+الكتم|الغاء\s+كتم)\b"
     )
 )
+_AR_SYNC_FILTER = filters.Regex(_AR_SYNC)
 
 ADMIN_STATUSES = {ChatMember.ADMINISTRATOR, ChatMember.OWNER}
 
@@ -174,16 +177,27 @@ async def _resolve_username(bot, chat_id: int, username: str):
     """
     uname_lower = username.lower()
 
-    # Step A: resolve username globally, then confirm/fetch via get_chat_member
+    # Step A: resolve username globally via Bot API, then confirm via get_chat_member.
     # get_chat_member is chat-scoped — works for silent members Pyrogram-style.
+    # We SAVE the user to DB immediately so every future lookup is instant.
     try:
         chat_user = await bot.get_chat(f"@{username}")
+        # Persist right away — this is the most reliable data we have
+        db.upsert_member(
+            chat_id,
+            chat_user.id,
+            getattr(chat_user, "username", None),
+            getattr(chat_user, "first_name", None),
+        )
+        _cache_user(chat_id, chat_user)
         try:
             member = await bot.get_chat_member(chat_id, chat_user.id)
-            # ChatMember subtypes expose .user
-            return getattr(member, "user", chat_user)
+            user = getattr(member, "user", chat_user)
+            # Update DB with richer User object from ChatMember
+            db.upsert_member(chat_id, user.id, user.username, user.first_name)
+            _cache_user(chat_id, user)
+            return user
         except Exception:
-            # Resolved globally but couldn't confirm membership — still usable
             return chat_user
     except Exception as exc:
         logger.debug("get_chat @%s failed: %s", username, exc)
@@ -193,6 +207,8 @@ async def _resolve_username(bot, chat_id: int, username: str):
         admins = await bot.get_chat_administrators(chat_id)
         for admin in admins:
             if (admin.user.username or "").lower() == uname_lower:
+                db.upsert_member(chat_id, admin.user.id, admin.user.username, admin.user.first_name)
+                _cache_user(chat_id, admin.user)
                 return admin.user
     except Exception as exc:
         logger.debug("get_chat_administrators for @%s failed: %s", username, exc)
@@ -202,7 +218,11 @@ async def _resolve_username(bot, chat_id: int, username: str):
     if db_uid:
         try:
             member = await bot.get_chat_member(chat_id, db_uid)
-            return getattr(member, "user", None)
+            user = getattr(member, "user", None)
+            if user:
+                db.upsert_member(chat_id, user.id, user.username, user.first_name)
+                _cache_user(chat_id, user)
+                return user
         except Exception as exc:
             logger.debug("DB uid %s get_chat_member failed: %s", db_uid, exc)
 
@@ -530,6 +550,83 @@ async def _cb_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError as exc:
         await query.answer(f"❌ فشل: {exc}", show_alert=True)
 
+# ── Full member scan (for /sync and تحديث الأعضاء) ───────────────────────────
+
+async def _scan_members(bot, chat_id: int) -> tuple[int, str]:
+    """
+    Enumerate group members and save every one to SQLite.
+
+    Returns (count_saved, method_used).
+
+    Strategy:
+      1. Pyrogram assistant.get_chat_members() — enumerates ALL members
+         (requires ASSISTANT_SESSION_STRING, API_ID, API_HASH).
+      2. Bot API get_chat_administrators() — admins only; always available.
+    """
+    # ── Strategy 1: Pyrogram full scan ────────────────────────────────────────
+    if ASSISTANT_ENABLED:
+        try:
+            from assistant.userbot import assistant as _assistant
+            if _assistant is not None:
+                if not _assistant.is_connected:
+                    await _assistant.start()
+                count = 0
+                async for member in _assistant.get_chat_members(chat_id):
+                    user = member.user
+                    if user and not user.is_bot:
+                        db.upsert_member(chat_id, user.id, user.username, user.first_name)
+                        _cache_user(chat_id, user)
+                        count += 1
+                logger.info("Full scan: saved %d members for chat %s", count, chat_id)
+                return count, "full"
+        except Exception as exc:
+            logger.warning("Pyrogram full scan failed for chat %s: %s — falling back to admin scan", chat_id, exc)
+
+    # ── Strategy 2: Bot API admin-only scan ───────────────────────────────────
+    count = 0
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if not admin.user.is_bot:
+                db.upsert_member(chat_id, admin.user.id, admin.user.username, admin.user.first_name)
+                _cache_user(chat_id, admin.user)
+                count += 1
+        logger.info("Admin scan: saved %d admins for chat %s", count, chat_id)
+    except Exception as exc:
+        logger.warning("Admin scan failed for chat %s: %s", chat_id, exc)
+
+    return count, "admins_only"
+
+
+async def _handle_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /sync or تحديث الأعضاء — scan all group members and save to DB.
+    Admin-only. Reports how many members were saved and which method was used.
+    """
+    msg = update.message
+    if msg.chat.type not in ("group", "supergroup"):
+        await msg.reply_text("⚠️ هذا الأمر يعمل فقط داخل المجموعات.")
+        return
+    if not await _is_admin(context.bot, msg.chat.id, msg.from_user.id):
+        await msg.reply_text("🚫 هذا الأمر للمشرفين فقط.")
+        return
+
+    status_msg = await msg.reply_text("🔄 جاري مزامنة الأعضاء، يرجى الانتظار…")
+    count, method = await _scan_members(context.bot, msg.chat.id)
+
+    if method == "full":
+        result = (
+            f"✅ تمت المزامنة الكاملة!\n"
+            f"📦 تم حفظ *{count}* عضو في قاعدة البيانات."
+        )
+    else:
+        result = (
+            f"✅ تمت مزامنة المشرفين ({count} عضو).\n"
+            f"⚠️ للمزامنة الكاملة لجميع الأعضاء، أضف `ASSISTANT_SESSION_STRING` إلى الإعدادات."
+        )
+
+    await status_msg.edit_text(result, parse_mode="Markdown")
+
 # ── Arabic trigger dispatcher ──────────────────────────────────────────────────
 
 async def arabic_trigger_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -557,9 +654,11 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("kick",   _handle_kick,   filters=group_filter))
     app.add_handler(CommandHandler("mute",   _handle_mute,   filters=group_filter))
     app.add_handler(CommandHandler("unmute", _handle_unmute, filters=group_filter))
+    app.add_handler(CommandHandler("sync",   _handle_sync,   filters=group_filter))
 
     # Arabic text triggers
     app.add_handler(MessageHandler(group_filter & _AR_MOD_FILTER, arabic_trigger_handler))
+    app.add_handler(MessageHandler(group_filter & _AR_SYNC_FILTER, _handle_sync))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(_cb_unmute, pattern=r"^unmute_\d+$"))
