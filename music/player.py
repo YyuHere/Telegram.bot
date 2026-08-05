@@ -262,7 +262,7 @@ async def play(chat_id: int, track: TrackInfo) -> bool:
 
     await call_py.join_group_call(
         chat_id,
-        MediaStream(track["url"]),
+        _make_stream(track["url"]),
     )
     logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
     return True
@@ -317,7 +317,7 @@ async def skip(chat_id: int) -> TrackInfo | None:
     if call_py is not None:
         await call_py.change_stream(
             chat_id,
-            MediaStream(next_track["url"]),
+            _make_stream(next_track["url"]),
         )
     logger.info("Skipped to: %s in chat %s", next_track["title"], chat_id)
     return next_track
@@ -370,7 +370,7 @@ if call_py is not None:
             try:
                 await call_py.change_stream(
                     chat_id,
-                    MediaStream(track["url"]),
+                    _make_stream(track["url"]),
                 )
             except Exception as exc:
                 logger.warning("Repeat stream failed: %s", exc)
@@ -385,7 +385,7 @@ if call_py is not None:
             try:
                 await call_py.change_stream(
                     chat_id,
-                    MediaStream(next_track["url"]),
+                    _make_stream(next_track["url"]),
                 )
             except Exception as exc:
                 logger.warning("Auto-play next failed: %s", exc)
