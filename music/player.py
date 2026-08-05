@@ -267,7 +267,13 @@ def get_audio_info(query: str) -> TrackInfo:
     with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info:
-            info = info["entries"][0]
+            entries = [e for e in (info["entries"] or []) if e]
+            if not entries:
+                raise RuntimeError(
+                    f"No results found for: {query!r}. "
+                    "Try a different search term or a direct YouTube URL."
+                )
+            info = entries[0]
 
         url: str = info.get("url") or info.get("webpage_url", "")
         if not url:
