@@ -113,76 +113,85 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
 
 # ── Target extraction (3-priority) ────────────────────────────────────────────
 
+async def _resolve_username(bot, chat_id: int, username: str):
+    """
+    Three-layer username resolution — mirrors what Pyrogram's get_chat_members()
+    fallback does, using only Bot API calls:
+
+    1. Global API lookup  — context.bot.get_chat("@username")
+       Works when the user has a public username the Bot API can resolve.
+
+    2. Admin list search  — get_chat_administrators(chat_id)
+       Always accessible regardless of privacy settings. Covers the common
+       case where the target is an admin or the admin list is small enough
+       that get_chat() privacy restrictions blocked step 1.
+
+    3. Member cache       — built organically from every message sent in the group.
+       Catches regular members who have sent at least one message since the
+       bot started (equivalent to iterating Pyrogram's get_chat_members()).
+    """
+    uname_lower = username.lower()
+
+    # Layer 1: global API lookup
+    try:
+        return await bot.get_chat(f"@{username}")
+    except Exception as exc:
+        logger.debug("get_chat @%s failed: %s", username, exc)
+
+    # Layer 2: admin list (always available, no privacy restrictions)
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if (admin.user.username or "").lower() == uname_lower:
+                return admin.user
+    except Exception as exc:
+        logger.debug("get_chat_administrators failed: %s", exc)
+
+    # Layer 3: member cache (organically filled from group traffic)
+    return _cache_search_username(chat_id, username)
+
+
 async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Resolve the moderation target — works for users WITH and WITHOUT a @username.
+    Resolve the moderation target for كتم @username, /mute @username, etc.
 
-    Priority 1 — Reply:
-        reply_to_message.from_user. Always reliable, zero parsing needed.
+    Order matches the uploaded spec exactly, adapted for python-telegram-bot:
 
-    Priority 2 — Entity scan (TEXT_MENTION + MENTION):
-        TEXT_MENTION: Telegram embeds the User object directly — the only
-            reliable path for users who have no @username set.
-        MENTION: parse_entity() reads the UTF-16 offsets Telegram provides,
-            so Arabic characters before @username never corrupt the slice.
-            Falls back to member cache if the Bot API can't resolve the name.
-
-    Priority 3 — Regex search in raw text:
-        re.search() finds @username or a numeric ID *anywhere* in the string,
-        completely unaffected by Arabic BiDi direction or invisible control
-        chars. No command-word stripping needed — regex skips Arabic naturally.
-          • r'@([a-zA-Z0-9_]+)'  → @username lookup → cache fallback
-          • r'\b\d{6,15}\b'      → numeric user-ID lookup
+    1. Reply            — reply_to_message.from_user (always reliable)
+    2. Regex @username  — re.search finds @username anywhere in the raw string,
+                          immune to Arabic BiDi direction or invisible chars.
+                          Falls back through 3 resolution layers if API fails.
+    3. TEXT_MENTION     — Telegram-embedded User object for users with no username.
+    4. Regex user-ID    — bare numeric ID anywhere in the text.
     """
-    msg = update.message
+    msg  = update.message
+    text = msg.text or ""
 
-    # ── Priority 1: reply ─────────────────────────────────────────────────────
+    # ── 1. Reply ──────────────────────────────────────────────────────────────
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
 
-    # ── Priority 2: entity scan ───────────────────────────────────────────────
-    for entity in msg.entities or []:
+    # ── 2. Regex @username (primary path for كتم @username) ──────────────────
+    username_match = re.search(r"@([a-zA-Z0-9_]+)", text)
+    if username_match:
+        username = username_match.group(1)
+        result = await _resolve_username(context.bot, msg.chat.id, username)
+        if result:
+            return result
 
-        # TEXT_MENTION — user without a @username; User object embedded directly
+    # ── 3. TEXT_MENTION entity — user with no @username ───────────────────────
+    # Checked after regex so that @username takes priority if both are present.
+    for entity in msg.entities or []:
         if entity.type == "text_mention" and entity.user:
             return entity.user
 
-        # MENTION — @username; parse_entity() gives correct UTF-16 slice
-        if entity.type == "mention":
-            raw      = msg.parse_entity(entity)   # e.g. "@username"
-            username = raw.lstrip("@").strip()
-            if not username:
-                continue
-            try:
-                return await context.bot.get_chat(f"@{username}")
-            except Exception as exc:
-                logger.debug("entity MENTION @%s failed: %s — trying cache", username, exc)
-                cached = _cache_search_username(msg.chat.id, username)
-                if cached:
-                    return cached
-
-    # ── Priority 3: regex fallback ────────────────────────────────────────────
-    text = msg.text or ""
-
-    # @username anywhere in the message (immune to BiDi / Arabic text around it)
-    mention_match = re.search(r"@([a-zA-Z0-9_]+)", text)
-    if mention_match:
-        username = mention_match.group(1)
-        try:
-            return await context.bot.get_chat(f"@{username}")
-        except Exception as exc:
-            logger.debug("regex @%s failed: %s — trying cache", username, exc)
-            cached = _cache_search_username(msg.chat.id, username)
-            if cached:
-                return cached
-
-    # Numeric user-ID (6-15 digits) anywhere in the message
+    # ── 4. Bare numeric user-ID anywhere in text ──────────────────────────────
     id_match = re.search(r"\b(\d{6,15})\b", text)
     if id_match:
         try:
             return await context.bot.get_chat(int(id_match.group(1)))
         except Exception as exc:
-            logger.debug("regex user-id %s failed: %s", id_match.group(1), exc)
+            logger.debug("user-id %s lookup failed: %s", id_match.group(1), exc)
 
     return None
 
