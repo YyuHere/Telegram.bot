@@ -115,54 +115,63 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
 
 async def _resolve_username(bot, chat_id: int, username: str):
     """
-    Three-layer username resolution — mirrors what Pyrogram's get_chat_members()
-    fallback does, using only Bot API calls:
+    Resolve a @username to a User — works even for members who have NEVER typed.
 
-    1. Global API lookup  — context.bot.get_chat("@username")
-       Works when the user has a public username the Bot API can resolve.
+    Bot API's get_chat_member(chat_id, user_id) is chat-scoped: Telegram resolves
+    it server-side without requiring the bot to have the user cached locally.
+    This is the equivalent of Pyrogram's get_chat_member(chat_id, "@username"),
+    which fixes the PeerIdInvalid error on silent members.
 
-    2. Admin list search  — get_chat_administrators(chat_id)
-       Always accessible regardless of privacy settings. Covers the common
-       case where the target is an admin or the admin list is small enough
-       that get_chat() privacy restrictions blocked step 1.
-
-    3. Member cache       — built organically from every message sent in the group.
-       Catches regular members who have sent at least one message since the
-       bot started (equivalent to iterating Pyrogram's get_chat_members()).
+    Steps (mirror the Pyrogram spec):
+    A. get_chat("@username") → get_chat_member(chat_id, user.id)
+       Two-step because Bot API get_chat_member only accepts integer user_id.
+       get_chat_member is the authoritative chat-scoped lookup.
+    B. get_chat("@username") alone — user exists globally but membership check failed.
+    C. Admin list search — always accessible, no privacy restrictions.
+    D. Member cache — organic fallback from group traffic.
     """
     uname_lower = username.lower()
 
-    # Layer 1: global API lookup
+    # Step A: resolve username globally, then confirm/fetch via get_chat_member
+    # get_chat_member is chat-scoped — works for silent members Pyrogram-style.
     try:
-        return await bot.get_chat(f"@{username}")
+        chat_user = await bot.get_chat(f"@{username}")
+        try:
+            member = await bot.get_chat_member(chat_id, chat_user.id)
+            # ChatMember subtypes expose .user
+            return getattr(member, "user", chat_user)
+        except Exception:
+            # Resolved globally but couldn't confirm membership — still usable
+            return chat_user
     except Exception as exc:
         logger.debug("get_chat @%s failed: %s", username, exc)
 
-    # Layer 2: admin list (always available, no privacy restrictions)
+    # Step B: admin list (always accessible, no privacy restrictions)
     try:
         admins = await bot.get_chat_administrators(chat_id)
         for admin in admins:
             if (admin.user.username or "").lower() == uname_lower:
                 return admin.user
     except Exception as exc:
-        logger.debug("get_chat_administrators failed: %s", exc)
+        logger.debug("get_chat_administrators for @%s failed: %s", username, exc)
 
-    # Layer 3: member cache (organically filled from group traffic)
+    # Step C: member cache (organic fallback — users who have sent messages)
     return _cache_search_username(chat_id, username)
 
 
 async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Resolve the moderation target for كتم @username, /mute @username, etc.
+    Works for ANY group member — including users who have NEVER typed a message.
 
-    Order matches the uploaded spec exactly, adapted for python-telegram-bot:
+    Order mirrors the Pyrogram spec, adapted for python-telegram-bot:
 
-    1. Reply            — reply_to_message.from_user (always reliable)
-    2. Regex @username  — re.search finds @username anywhere in the raw string,
-                          immune to Arabic BiDi direction or invisible chars.
-                          Falls back through 3 resolution layers if API fails.
-    3. TEXT_MENTION     — Telegram-embedded User object for users with no username.
-    4. Regex user-ID    — bare numeric ID anywhere in the text.
+    1. Reply          — reply_to_message.from_user (always reliable, zero parsing)
+    2. Regex @username — re.search anywhere in raw text (immune to Arabic BiDi).
+                         Resolved via _resolve_username() — chat-scoped lookup first.
+    3. Regex user-ID  — bare numeric ID: get_chat_member(chat_id, id) FIRST
+                         (chat-scoped, works for silent members), then get_chat fallback.
+    4. TEXT_MENTION   — Telegram-embedded User object for members with no @username.
     """
     msg  = update.message
     text = msg.text or ""
@@ -171,27 +180,33 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
 
-    # ── 2. Regex @username (primary path for كتم @username) ──────────────────
+    # ── 2. Regex @username → _resolve_username() ─────────────────────────────
     username_match = re.search(r"@([a-zA-Z0-9_]+)", text)
     if username_match:
-        username = username_match.group(1)
-        result = await _resolve_username(context.bot, msg.chat.id, username)
+        result = await _resolve_username(context.bot, msg.chat.id, username_match.group(1))
         if result:
             return result
 
-    # ── 3. TEXT_MENTION entity — user with no @username ───────────────────────
-    # Checked after regex so that @username takes priority if both are present.
+    # ── 3. Regex numeric user-ID ─────────────────────────────────────────────
+    # get_chat_member(chat_id, int_id) is tried FIRST — it's chat-scoped and
+    # works even if the user has never sent a message (fixes PeerIdInvalid).
+    id_match = re.search(r"\b(\d{6,15})\b", text)
+    if id_match:
+        user_id = int(id_match.group(1))
+        try:
+            member = await context.bot.get_chat_member(msg.chat.id, user_id)
+            return getattr(member, "user", None)
+        except Exception as exc:
+            logger.debug("get_chat_member id %s failed: %s — trying get_chat", user_id, exc)
+        try:
+            return await context.bot.get_chat(user_id)
+        except Exception as exc:
+            logger.debug("get_chat id %s also failed: %s", user_id, exc)
+
+    # ── 4. TEXT_MENTION — member with no @username ────────────────────────────
     for entity in msg.entities or []:
         if entity.type == "text_mention" and entity.user:
             return entity.user
-
-    # ── 4. Bare numeric user-ID anywhere in text ──────────────────────────────
-    id_match = re.search(r"\b(\d{6,15})\b", text)
-    if id_match:
-        try:
-            return await context.bot.get_chat(int(id_match.group(1)))
-        except Exception as exc:
-            logger.debug("user-id %s lookup failed: %s", id_match.group(1), exc)
 
     return None
 

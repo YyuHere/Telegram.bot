@@ -1,0 +1,56 @@
+The issue happens when targeting a user who has NEVER typed in the chat. Pyrogram's `get_users("@username")` fails with `PeerIdInvalid` because the bot session doesn't have the user cached.
+
+To fix this so the bot can mute/ban ANY user in the group even if they never typed a single message:
+
+Update the `extract_user` function to strictly fetch the member using `client.get_chat_member(chat_id, username_or_id)`:
+
+```python
+import re
+from pyrogram.enums import MessageEntityType
+from pyrogram.errors import UsernameInvalid, PeerIdInvalid, UserNotParticipant
+
+async def extract_user(client, message):
+    # 1. Reply Mode
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+
+    text = message.text or ""
+    
+    # Extract @username or numeric ID from text using Regex
+    mention_match = re.search(r'@([a-zA-Z0-9_]+)', text)
+    id_match = re.search(r'\b\d{6,15}\b', text)
+    
+    target = None
+    if mention_match:
+        target = mention_match.group(1)
+    elif id_match:
+        target = int(id_match.group(0))
+
+    if target:
+        # A. First try fetching directly from chat members!
+        try:
+            member = await client.get_chat_member(message.chat.id, target)
+            if member and member.user:
+                return member.user
+        except (UserNotParticipant, PeerIdInvalid, UsernameInvalid, Exception):
+            pass
+
+        # B. Second try global get_users
+        try:
+            return await client.get_users(target)
+        except Exception:
+            pass
+
+        # C. Fallback: Iterate over chat members list manually
+        if isinstance(target, str):
+            async for member in client.get_chat_members(message.chat.id):
+                if member.user and member.user.username and member.user.username.lower() == target.lower():
+                    return member.user
+
+    # 2. Check Text Mention Entities
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == MessageEntityType.TEXT_MENTION:
+                return entity.user
+
+    return None
