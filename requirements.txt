@@ -5,21 +5,18 @@ python-telegram-bot==21.5
 python-dotenv>=1.0.1
 
 # Pyrogram MTProto client (Assistant userbot + full member scan)
-pyrogram>=2.0.106
+# 2.0.106 is the stable release compatible with py-tgcalls.
+# NOTE: GroupcallForbidden was removed from pyrogram.errors in this release;
+# music/player.py patches it back in at runtime before py-tgcalls imports it.
+pyrogram==2.0.106
 tgcrypto
 
 # Voice chat streaming.
-# py-tgcalls is the actively-maintained successor to pytgcalls 3.x.
-# It provides the same `pytgcalls` Python module but without the unavailable
-# native `tgcalls` binary dependency. Uses MediaStream instead of AudioPiped.
+# py-tgcalls is the only installable pytgcalls-compatible package in this
+# environment — the legacy pytgcalls package (0.0.x / 1.0.0 / 2.x) all
+# require a native `tgcalls` binary that is not available here.
+# The GroupcallForbidden import incompatibility is resolved in music/player.py.
 py-tgcalls
 
 # Audio download / stream URL resolution
-yt-dlp
-py-tgcalls
-pyrogram>=2.0.106
-python-dotenv
-python-telegram-bot==21.5
-telegram
-tgcrypto
 yt-dlp

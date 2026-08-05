@@ -29,27 +29,89 @@ call_py = None
 _AudioPiped = None
 _HighQualityAudio = None
 
+def _make_stream(url: str):
+    """
+    Build the pytgcalls stream object for *url*, compatible with whichever
+    pytgcalls API version is installed:
+
+      • pytgcalls 0.8.x  →  AudioPiped(url, HighQualityAudio())
+      • py-tgcalls / pytgcalls ≥ 3.x  →  MediaStream(url)
+
+    Resolved once at module load; all playback helpers call _make_stream().
+    """
+    return _stream_builder(url)
+
+
+# ── Resolve the streaming API available in the installed pytgcalls package ──
+
+def _resolve_stream_builder():
+    """
+    Detect which pytgcalls streaming constructor is available and return a
+    callable ``url → stream_object``.
+
+    Tries newer MediaStream first (py-tgcalls / pytgcalls ≥ 3.x), then falls
+    back to AudioPiped / HighQualityAudio (pytgcalls 0.8.x).  Either way the
+    full traceback is logged on failure so the exact import error is visible.
+    """
+    try:
+        from pytgcalls.types import MediaStream  # py-tgcalls / 3.x
+        logger.info("pytgcalls: using MediaStream API")
+        return lambda url: MediaStream(url)
+    except ImportError:
+        pass
+
+    try:
+        from pytgcalls.types.input_stream import AudioPiped
+        from pytgcalls.types.input_stream.quality import HighQualityAudio
+        logger.info("pytgcalls: using AudioPiped / HighQualityAudio API (0.8.x)")
+        return lambda url: AudioPiped(url, HighQualityAudio())
+    except ImportError:
+        pass
+
+    logger.error(
+        "pytgcalls: neither MediaStream nor AudioPiped could be imported. "
+        "Check that pytgcalls / py-tgcalls is installed correctly."
+    )
+    return lambda url: None  # call_py will be None; commands will show error
+
+
 if assistant is not None:
     try:
+        # ── Compatibility patch ───────────────────────────────────────────────
+        # py-tgcalls does `from pyrogram.errors import GroupcallForbidden`
+        # inside pytgcalls/mtproto/pyrogram_client.py, but pyrogram 2.0.106
+        # removed that error class.  Injecting a stub into the pyrogram.errors
+        # namespace *before* pytgcalls is first imported prevents the
+        # ImportError without changing any runtime behaviour — the exception is
+        # used only in a bare `except` clause and is never raised by pyrogram
+        # itself in this version.
+        import pyrogram.errors as _pyr_errors
+        if not hasattr(_pyr_errors, 'GroupcallForbidden'):
+            _pyr_errors.GroupcallForbidden = type(
+                'GroupcallForbidden', (Exception,), {}
+            )
+            logger.debug(
+                "Injected GroupcallForbidden stub into pyrogram.errors "
+                "(missing in pyrogram 2.0.106 but required by py-tgcalls)."
+            )
+
         from pytgcalls import PyTgCalls
-        # py-tgcalls (the maintained successor to pytgcalls 3.x) exposes
-        # MediaStream instead of the old AudioPiped / HighQualityAudio API.
-        from pytgcalls.types import MediaStream
+        _stream_builder = _resolve_stream_builder()
         call_py = PyTgCalls(assistant)
         logger.info("PyTgCalls instance created successfully.")
     except Exception:
         # logger.exception() prints the full traceback, not just the message,
-        # so the exact failure reason is visible in the server log.
+        # so the exact failure reason (import error, version mismatch, bad
+        # session string, missing native library, …) is visible in the logs.
         logger.exception(
             "Failed to create PyTgCalls instance. "
-            "Check that py-tgcalls, pyrogram, and tgcrypto are installed and "
-            "that ASSISTANT_SESSION_STRING is valid."
+            "Check that py-tgcalls, pyrogram==2.0.106, and tgcrypto are "
+            "installed at compatible versions, and that "
+            "ASSISTANT_SESSION_STRING is valid."
         )
+        _stream_builder = lambda url: None
 else:
-    # Stub so the rest of the module can reference MediaStream safely even
-    # when the assistant is not configured.
-    class MediaStream:  # type: ignore[no-redef]
-        def __init__(self, *a, **kw): ...
+    _stream_builder = lambda url: None
 
 
 # ─── Track info TypedDict ─────────────────────────────────────────────────────
