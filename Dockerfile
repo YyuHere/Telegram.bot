@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     ffmpeg \
     python3-pip \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Working directory
