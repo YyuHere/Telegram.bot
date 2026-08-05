@@ -69,18 +69,13 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Resolve the target user from the incoming message.
 
     Priority 1 — Reply:
-        If the message is a reply, use reply_to_message.from_user directly.
+        reply_to_message.from_user — always reliable, no parsing needed.
 
-    Priority 2 — Entity scan:
-        Iterate message.entities; for MENTION entities use parse_entity() which
-        applies the Bot API's UTF-16 offsets correctly (so Arabic chars before
-        @username don't corrupt the slice). For TEXT_MENTION entities the user
-        object is embedded directly.
-
-    Priority 3 — Text split fallback:
+    Priority 2 — Text split:
         Split message.text on whitespace and check each token:
-          • Starts with "@"   → treat as @username.
-          • All digits ≥5     → treat as a numeric user-ID.
+          • Starts with "@"  → strip @ and resolve as @username.
+          • All digits       → resolve as a numeric user-ID.
+        Skips the Arabic trigger word itself since it won't match either rule.
     """
     msg = update.message
 
@@ -88,38 +83,21 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
 
-    # ── Priority 2: entity scan ───────────────────────────────────────────────
-    for entity in msg.entities or []:
-        if entity.type == "mention":
-            # parse_entity handles UTF-16 offsets — safe with Arabic preceding text
-            raw = msg.parse_entity(entity)          # e.g. "@username"
-            username = raw.lstrip("@").strip()
+    # ── Priority 2: text split ────────────────────────────────────────────────
+    text_parts = msg.text.split() if msg.text else []
+    for part in text_parts:
+        if part.startswith("@"):
+            username = part.replace("@", "").strip()
             if username:
                 try:
                     return await context.bot.get_chat(f"@{username}")
-                except TelegramError as exc:
-                    logger.debug("entity MENTION: could not resolve @%s — %s", username, exc)
-
-        elif entity.type == "text_mention" and entity.user:
-            # Inline mention for users without a public username
-            return entity.user
-
-    # ── Priority 3: text split fallback ──────────────────────────────────────
-    text = msg.text or msg.caption or ""
-    for token in text.split():
-        if token.startswith("@"):
-            username = token.lstrip("@").strip(".,!؟?")
-            if username:
-                try:
-                    return await context.bot.get_chat(f"@{username}")
-                except TelegramError as exc:
-                    logger.debug("split @: could not resolve @%s — %s", username, exc)
-
-        elif token.isdigit() and len(token) >= 5:
+                except Exception:
+                    continue
+        elif part.isdigit():
             try:
-                return await context.bot.get_chat(int(token))
-            except TelegramError as exc:
-                logger.debug("split digit: could not resolve id %s — %s", token, exc)
+                return await context.bot.get_chat(int(part))
+            except Exception:
+                continue
 
     return None
 
