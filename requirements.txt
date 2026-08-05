@@ -4,12 +4,12 @@ python-telegram-bot==21.5
 # Environment variable loading
 python-dotenv>=1.0.1
 
-# Pyrogram MTProto client (Assistant userbot + full member scan)
+# Pyrogram MTProto client
 pyrogram==2.0.106
 tgcrypto
 
-# Voice chat streaming (Fixed 1.2.0 version without native tgcalls dependencies)
-pytgcalls==1.2.0
+# Voice chat streaming
+pytgcalls==1.0.0
 
 # Audio download / stream URL resolution
 yt-dlp
