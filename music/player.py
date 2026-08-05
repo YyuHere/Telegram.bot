@@ -214,7 +214,6 @@ def _ydl_opts() -> dict:
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
-        "default_search": "ytsearch",
         "noplaylist": True,
         # Force the Android InnerTube player — bypasses the bot-check gate
         # that YouTube applies to headless web requests.
@@ -257,34 +256,94 @@ def _fmt_duration(secs: int) -> str:
     return f"{m}:{s:02d}"
 
 
+def _is_url(text: str) -> bool:
+    """Return True if *text* looks like a direct URL rather than a search query."""
+    return text.startswith(("http://", "https://", "www."))
+
+
+def _extract_first_valid(info: dict, query: str) -> TrackInfo | None:
+    """
+    Given a yt-dlp result dict, extract the first entry with a usable URL.
+    Returns None if no valid entry exists (so the caller can try a fallback).
+    """
+    if "entries" in info:
+        entries = [e for e in (info["entries"] or []) if e]
+        if not entries:
+            return None
+        info = entries[0]
+
+    url: str = info.get("url") or info.get("webpage_url", "")
+    if not url:
+        return None
+
+    return TrackInfo(
+        url=url,
+        title=info.get("title", query),
+        duration=_fmt_duration(info.get("duration") or 0),
+        thumbnail=info.get("thumbnail", ""),
+    )
+
+
 def get_audio_info(query: str) -> TrackInfo:
     """
-    Resolve *query* (title or direct URL) via yt-dlp.
+    Resolve *query* (song name or direct URL) via yt-dlp.
+
+    Search strategy for text queries (including Arabic names):
+      1. ``ytsearch5:<query>``  — fetch 5 YouTube candidates, pick the first
+         with a valid audio URL.  Using 5 results instead of 1 makes Arabic
+         and transliterated titles far more robust because yt-dlp can try the
+         next candidate when an individual video is age-gated or geo-blocked.
+      2. ``scsearch1:<query>``  — SoundCloud fallback; useful when YouTube
+         search returns no results for niche or regional tracks.
+
+    Direct URLs (http/https/www) skip search and are resolved immediately.
 
     Returns a TrackInfo dict: url, title, duration (m:ss), thumbnail URL.
-    Raises RuntimeError if nothing is found.
+    Raises RuntimeError with a descriptive message if nothing is found.
     """
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if "entries" in info:
-            entries = [e for e in (info["entries"] or []) if e]
-            if not entries:
-                raise RuntimeError(
-                    f"No results found for: {query!r}. "
-                    "Try a different search term or a direct YouTube URL."
-                )
-            info = entries[0]
+    opts = _ydl_opts()
 
-        url: str = info.get("url") or info.get("webpage_url", "")
-        if not url:
-            raise RuntimeError(f"Could not resolve audio URL for: {query!r}")
+    # ── Direct URL: resolve immediately, no search prefix needed ─────────────
+    if _is_url(query):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+        track = _extract_first_valid(info, query)
+        if track:
+            return track
+        raise RuntimeError(f"Could not resolve audio from URL: {query!r}")
 
-        return TrackInfo(
-            url=url,
-            title=info.get("title", query),
-            duration=_fmt_duration(info.get("duration") or 0),
-            thumbnail=info.get("thumbnail", ""),
-        )
+    # ── Text search: YouTube first, SoundCloud fallback ───────────────────────
+    # Stage 1 — YouTube: ytsearch5 fetches up to 5 candidates.
+    # We pick the first one yt-dlp returns with a valid URL.
+    yt_query = f"ytsearch5:{query}"
+    logger.debug("yt-dlp: searching YouTube → %r", yt_query)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(yt_query, download=False)
+        track = _extract_first_valid(info, query)
+        if track:
+            logger.debug("yt-dlp: YouTube result → %r", track["title"])
+            return track
+    except Exception as exc:
+        logger.warning("yt-dlp: YouTube search failed for %r: %s", query, exc)
+
+    # Stage 2 — SoundCloud fallback (no bot-check, good Arabic catalogue).
+    sc_query = f"scsearch1:{query}"
+    logger.debug("yt-dlp: YouTube gave no results, trying SoundCloud → %r", sc_query)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(sc_query, download=False)
+        track = _extract_first_valid(info, query)
+        if track:
+            logger.debug("yt-dlp: SoundCloud result → %r", track["title"])
+            return track
+    except Exception as exc:
+        logger.warning("yt-dlp: SoundCloud search failed for %r: %s", query, exc)
+
+    raise RuntimeError(
+        f"لم يتم العثور على نتائج لـ: {query!r}\n"
+        "جرّب اسمًا آخر للأغنية أو أرسل رابط YouTube مباشرًا."
+    )
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
