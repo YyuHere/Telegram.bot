@@ -20,17 +20,41 @@ from assistant.userbot import assistant
 logger = logging.getLogger(__name__)
 
 # ─── pytgcalls setup ──────────────────────────────────────────────────────────
-# call_py is only created when the assistant client exists.
+# call_py is only created when the assistant (Pyrogram Client) exists.
+# Any import or instantiation failure is logged with a full traceback so the
+# root cause (missing native library, wrong package version, bad session, …)
+# is immediately visible in the server logs instead of surfacing only as the
+# Arabic "فشل تهيئة محرك الصوت" message in Telegram.
 call_py = None
+_AudioPiped = None
+_HighQualityAudio = None
+
 if assistant is not None:
     try:
         from pytgcalls import PyTgCalls
-        from pytgcalls.types.input_stream import AudioPiped
-        from pytgcalls.types.input_stream.quality import HighQualityAudio
+        from pytgcalls.types.input_stream import AudioPiped as _AudioPiped          # noqa: F401
+        from pytgcalls.types.input_stream.quality import HighQualityAudio as _HighQualityAudio  # noqa: F401
+        AudioPiped = _AudioPiped
+        HighQualityAudio = _HighQualityAudio
         call_py = PyTgCalls(assistant)
-        logger.info("PyTgCalls instance created.")
-    except Exception as _exc:
-        logger.warning("Failed to create PyTgCalls instance: %s", _exc)
+        logger.info("PyTgCalls instance created successfully.")
+    except Exception:
+        # Log the full traceback — not just the one-line message — so the exact
+        # failure reason (ImportError, version mismatch, session error, …) is
+        # printed to the server log.
+        logger.exception(
+            "Failed to create PyTgCalls instance. "
+            "Check that pytgcalls, pyrogram, and tgcrypto are installed at "
+            "compatible versions, and that the ASSISTANT_SESSION_STRING is valid."
+        )
+else:
+    # Define stubs so the rest of the module can import the names safely even
+    # when the assistant is not configured.
+    class AudioPiped:  # type: ignore[no-redef]
+        def __init__(self, *a, **kw): ...
+
+    class HighQualityAudio:  # type: ignore[no-redef]
+        def __init__(self, *a, **kw): ...
 
 
 # ─── Track info TypedDict ─────────────────────────────────────────────────────
@@ -72,16 +96,32 @@ _pytgcalls_started = False
 
 
 async def ensure_pytgcalls_started() -> None:
-    """Start the PyTgCalls client once. Safe to call multiple times."""
+    """
+    Start the PyTgCalls client once, attached to the Pyrogram assistant.
+    Safe to call multiple times — subsequent calls are no-ops.
+
+    If startup fails (e.g. the session string is expired or invalid, the
+    Pyrogram Client was never connected, or a native library is missing),
+    the full exception traceback is logged so the root cause is immediately
+    visible in the server output.
+    """
     global _pytgcalls_started
     if call_py is None or _pytgcalls_started:
         return
     try:
         await call_py.start()
         _pytgcalls_started = True
-        logger.info("PyTgCalls client started.")
-    except Exception as exc:
-        logger.warning("PyTgCalls start failed: %s", exc)
+        logger.info("PyTgCalls client started successfully.")
+    except Exception:
+        # Use logger.exception() so the full stack trace is printed.
+        # Common causes: session string expired/invalid, Pyrogram client not
+        # yet connected, missing tgcalls native bindings, or version mismatch
+        # between pyrogram / pytgcalls / tgcrypto.
+        logger.exception(
+            "PyTgCalls .start() failed — voice chat streaming will be "
+            "unavailable. Check the ASSISTANT_SESSION_STRING secret and "
+            "ensure pyrogram, pytgcalls, and tgcrypto are at compatible versions."
+        )
 
 
 # ─── yt-dlp helpers ───────────────────────────────────────────────────────────

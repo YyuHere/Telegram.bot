@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libssl-dev \
     ffmpeg \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Working directory
