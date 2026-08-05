@@ -68,35 +68,69 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Resolve the target user from the incoming message.
 
-    Priority 1 — Reply:
-        reply_to_message.from_user — always reliable, no parsing needed.
+    Supports: `كتم @username` or `/mute @username` (command FIRST, mention AFTER).
 
-    Priority 2 — Text split:
-        Split message.text on whitespace and check each token:
-          • Starts with "@"  → strip @ and resolve as @username.
-          • All digits       → resolve as a numeric user-ID.
-        Skips the Arabic trigger word itself since it won't match either rule.
+    Priority 1 — Reply:
+        reply_to_message.from_user — always reliable, zero parsing.
+
+    Priority 2 — Entity scan:
+        message.entities gives exact byte-offset data unaffected by Unicode
+        BiDi reordering. Handles MENTION (@username) and TEXT_MENTION (users
+        without a public username). This is the most reliable path for mentions.
+
+    Priority 3 — Text split with BiDi stripping:
+        Split on whitespace and check every token after stripping invisible
+        Unicode bidirectional control characters (U+200B..U+200F, U+202A..
+        U+202E, U+2066..U+2069, U+FEFF) that Telegram inserts around Latin
+        text (like @username) inside an Arabic RTL message. Without stripping,
+        part.startswith("@") silently fails even when the @ is visually there.
     """
     msg = update.message
+
+    # Invisible Unicode chars Telegram may inject around LTR text in RTL context
+    _BIDI_CHARS = (
+        "\u200b\u200c\u200d\u200e\u200f"
+        "\u202a\u202b\u202c\u202d\u202e"
+        "\u2066\u2067\u2068\u2069\ufeff"
+    )
 
     # ── Priority 1: reply ─────────────────────────────────────────────────────
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
 
-    # ── Priority 2: text split ────────────────────────────────────────────────
-    text_parts = msg.text.split() if msg.text else []
-    for part in text_parts:
-        if part.startswith("@"):
-            username = part.replace("@", "").strip()
+    # ── Priority 2: entity scan ───────────────────────────────────────────────
+    for entity in msg.entities or []:
+        if entity.type == "mention":
+            # parse_entity() applies the API's UTF-16 offsets correctly —
+            # Arabic chars before @username don't shift the slice.
+            raw = msg.parse_entity(entity)          # e.g. "@username"
+            username = raw.lstrip("@").strip(_BIDI_CHARS).strip()
             if username:
                 try:
                     return await context.bot.get_chat(f"@{username}")
-                except Exception:
+                except Exception as exc:
+                    logger.debug("entity MENTION @%s failed: %s", username, exc)
+        elif entity.type == "text_mention" and entity.user:
+            return entity.user  # user object embedded directly (no username)
+
+    # ── Priority 3: text split with BiDi stripping ───────────────────────────
+    text_parts = msg.text.split() if msg.text else []
+    for part in text_parts:
+        # Strip invisible BiDi control chars before checking the token
+        clean = part.strip(_BIDI_CHARS)
+        if clean.startswith("@"):
+            username = clean.lstrip("@").strip(_BIDI_CHARS).strip()
+            if username:
+                try:
+                    return await context.bot.get_chat(f"@{username}")
+                except Exception as exc:
+                    logger.debug("split @%s failed: %s", username, exc)
                     continue
-        elif part.isdigit():
+        elif clean.isdigit():
             try:
-                return await context.bot.get_chat(int(part))
-            except Exception:
+                return await context.bot.get_chat(int(clean))
+            except Exception as exc:
+                logger.debug("split id %s failed: %s", clean, exc)
                 continue
 
     return None
