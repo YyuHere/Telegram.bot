@@ -1,50 +1,59 @@
-# Telegram Bot
+# Telegram Bot + Assistant Userbot
 
-A Python Telegram bot with group moderation, Ludo Club referral code extraction, and music/voice chat features.
+A production-ready Telegram group management bot with a companion Pyrogram userbot.
 
 ## Stack
-
-- **Runtime:** Python 3.11+
-- **Framework:** python-telegram-bot v21 (async polling)
-- **Database:** SQLite (`telegram-bot/members.db`)
-- **Optional userbot:** Pyrogram + pytgcalls for voice chat
+- **python-telegram-bot v21** — main bot (async polling)
+- **Pyrogram** — assistant userbot for full member enumeration
+- **pytgcalls + yt-dlp** — voice chat music streaming (placeholder, coming soon)
+- **SQLite** — local member and auto-reply store
 
 ## Project Structure
 
 ```
-telegram-bot/
+.
 ├── main.py                  # Entry point
-├── config.py                # Environment variable loader & validator
-├── generate_session.py      # One-time helper: generate Assistant session string
+├── config.py                # Env var loader & validator
+├── db.py                    # SQLite helpers (members + replies)
+├── generate_session.py      # One-time: generate Pyrogram session string
 ├── requirements.txt
+├── Dockerfile               # Docker / Railway deployment
+├── Procfile                 # Railway worker process
+│
+├── assistant/
+│   └── userbot.py           # Pyrogram assistant client
+│
 ├── handlers/
 │   ├── general.py           # /start, /help, /ping
+│   ├── ludo.py              # Ludo Club code extractor
 │   ├── moderation.py        # /ban /unban /kick /mute /unmute + Arabic triggers
-│   └── ludo.py              # Ludo Club code extractor
-├── music/
-│   ├── player.py            # pytgcalls audio engine + queue
-│   └── commands.py          # /play, /stop, /pause, /resume, /skip
-└── assistant/
-    └── userbot.py           # Pyrogram userbot client + group-join helper
+│   └── replies.py           # Auto-reply system (اضافه رد)
+│
+└── music/
+    ├── commands.py          # /play /stop /pause /resume /skip (placeholder)
+    └── player.py            # pytgcalls audio engine + queue
 ```
 
-## Running the Bot
+## How to Run
 
-The bot requires a `BOT_TOKEN` secret (set via Replit Secrets).
+The `Telegram Bot` workflow runs `python main.py` from the root directory.
 
-```bash
-cd telegram-bot && python main.py
-```
+Required secrets (add via Replit Secrets):
+- `BOT_TOKEN` — from @BotFather
 
-## Required Secrets
+Optional secrets (enable full member sync via Pyrogram assistant):
+- `API_ID` — from my.telegram.org/apps
+- `API_HASH` — from my.telegram.org/apps
+- `ASSISTANT_SESSION_STRING` — generate once with `python generate_session.py`
 
-| Secret | Description | Required |
-|---|---|---|
-| `BOT_TOKEN` | Bot token from @BotFather | Yes |
-| `API_ID` | From my.telegram.org/apps | Only for music/voice |
-| `API_HASH` | From my.telegram.org/apps | Only for music/voice |
-| `ASSISTANT_SESSION_STRING` | Pyrogram session (run `generate_session.py` once) | Only for music/voice |
+Optional:
+- `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
+
+## Deployment
+
+Deployed on Railway using the `Procfile` (`worker: python main.py`) or `Dockerfile`.
+All secrets are injected as environment variables at runtime.
 
 ## User Preferences
-
-<!-- Add any agent preferences here -->
+- Keep the bot code flat at root (no nested subdirectory for the bot).
+- All Telegram bot files live directly at root alongside `main.py`.

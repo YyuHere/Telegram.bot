@@ -14,6 +14,7 @@ will be None and callers must guard with `if assistant is not None`.
 """
 
 import logging
+from pyrogram import Client
 from config import API_ID, API_HASH, ASSISTANT_SESSION_STRING, ASSISTANT_ENABLED
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 assistant = None
 if ASSISTANT_ENABLED:
     try:
-        from pyrogram import Client
         assistant = Client(
             name="assistant",
             api_id=API_ID,

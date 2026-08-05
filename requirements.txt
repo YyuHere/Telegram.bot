@@ -1,0 +1,15 @@
+# Telegram Bot API library — async, no API_ID/API_HASH needed
+python-telegram-bot==21.5
+
+# Environment variable loading
+python-dotenv>=1.0.1
+
+# Pyrogram MTProto client (Assistant userbot + full member scan)
+pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# Voice chat streaming
+pytgcalls==3.0.0.dev24
+
+# Audio download / stream URL resolution
+yt-dlp>=2024.4.9
