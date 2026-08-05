@@ -35,6 +35,8 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
+import db
+
 logger = logging.getLogger(__name__)
 
 # ── Member cache ──────────────────────────────────────────────────────────────
@@ -78,12 +80,29 @@ def _cache_search_name(chat_id: int, query: str):
 
 async def update_member_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    MessageHandler that silently caches every group message sender.
-    Registered with a low priority so it never interferes with other handlers.
+    MessageHandler: persists every group message sender to SQLite + in-memory cache.
+    Registered at group=-1 so it never blocks moderation handlers.
     """
     msg = update.message
     if msg and msg.from_user:
-        _cache_user(msg.chat.id, msg.from_user)
+        u = msg.from_user
+        _cache_user(msg.chat.id, u)
+        db.upsert_member(msg.chat.id, u.id, u.username, u.first_name)
+
+
+async def on_new_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fires when someone joins the group. Saves them to DB immediately —
+    BEFORE they ever send a message — so the bot can mute/ban them right away.
+    """
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+    for user in msg.new_chat_members:
+        if not user.is_bot:
+            _cache_user(msg.chat.id, user)
+            db.upsert_member(msg.chat.id, user.id, user.username, user.first_name)
+            logger.debug("Saved on join: %s (@%s) in chat %s", user.id, user.username, msg.chat.id)
 
 
 # ── Arabic trigger patterns ────────────────────────────────────────────────────
