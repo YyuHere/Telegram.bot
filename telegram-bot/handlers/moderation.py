@@ -22,6 +22,8 @@ from telegram import (
     Update,
     ChatPermissions,
     ChatMember,
+    ChatMemberRestricted,
+    ChatMemberBanned,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -130,6 +132,27 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
     except TelegramError:
         return False
 
+
+async def _is_muted(bot, chat_id: int, user_id: int) -> bool:
+    """Return True if the user is already restricted (cannot send messages)."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if isinstance(member, ChatMemberRestricted):
+            return not member.can_send_messages
+    except TelegramError:
+        pass
+    return False
+
+
+async def _is_banned(bot, chat_id: int, user_id: int) -> bool:
+    """Return True if the user is already banned from the chat."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return isinstance(member, ChatMemberBanned)
+    except TelegramError:
+        pass
+    return False
+
 # ── Target extraction (3-priority) ────────────────────────────────────────────
 
 async def _resolve_username(bot, chat_id: int, username: str):
@@ -174,7 +197,16 @@ async def _resolve_username(bot, chat_id: int, username: str):
     except Exception as exc:
         logger.debug("get_chat_administrators for @%s failed: %s", username, exc)
 
-    # Step C: member cache (organic fallback — users who have sent messages)
+    # Step C: SQLite DB — persists members who joined but never typed a message
+    db_uid = db.find_by_username(chat_id, username)
+    if db_uid:
+        try:
+            member = await bot.get_chat_member(chat_id, db_uid)
+            return getattr(member, "user", None)
+        except Exception as exc:
+            logger.debug("DB uid %s get_chat_member failed: %s", db_uid, exc)
+
+    # Step D: in-memory cache (organic fallback — users who have sent messages)
     return _cache_search_username(chat_id, username)
 
 
@@ -226,6 +258,25 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for entity in msg.entities or []:
         if entity.type == "text_mention" and entity.user:
             return entity.user
+
+    # ── 5. Name-based SQLite lookup ───────────────────────────────────────────
+    # Strip the command/trigger word (first token) and try the remainder as a name.
+    # e.g. "كتم Ahmed" → query "Ahmed"; "/mute John Doe" → query "John Doe"
+    tokens = text.split()
+    if len(tokens) > 1:
+        name_query = " ".join(tokens[1:]).strip()
+        if name_query:
+            db_uid = db.find_by_name(msg.chat.id, name_query)
+            if db_uid:
+                try:
+                    member = await context.bot.get_chat_member(msg.chat.id, db_uid)
+                    return getattr(member, "user", None)
+                except Exception as exc:
+                    logger.debug("DB name lookup uid %s get_chat_member failed: %s", db_uid, exc)
+            # Also try in-memory cache by name as a final fallback
+            cached = _cache_search_name(msg.chat.id, name_query)
+            if cached:
+                return cached
 
     return None
 
@@ -287,6 +338,9 @@ async def _handle_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if err:
         await update.message.reply_text(err)
         return
+    if await _is_banned(context.bot, update.message.chat.id, target.id):
+        await update.message.reply_text("⚠️ هذا العضو محظور بالفعل!")
+        return
     try:
         await context.bot.ban_chat_member(update.message.chat.id, target.id)
         await update.message.reply_text(
@@ -337,6 +391,9 @@ async def _handle_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     target, err = await _check(update, context)
     if err:
         await update.message.reply_text(err)
+        return
+    if await _is_muted(context.bot, update.message.chat.id, target.id):
+        await update.message.reply_text("⚠️ هذا العضو مكتوم بالفعل!")
         return
     try:
         await context.bot.restrict_chat_member(
@@ -507,6 +564,11 @@ def register(app: Application) -> None:
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(_cb_unmute, pattern=r"^unmute_\d+$"))
     app.add_handler(CallbackQueryHandler(_cb_unban,  pattern=r"^unban_\d+$"))
+
+    # New chat members — saves joining users immediately (before they type anything)
+    app.add_handler(
+        MessageHandler(group_filter & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_member)
+    )
 
     # Member cache — runs on EVERY group message (group=-1 = lowest priority,
     # so it never blocks moderation handlers from running first)
