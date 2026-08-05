@@ -1,0 +1,54 @@
+Some Telegram users do NOT have a @username set. The moderation system must support finding users by their Display Name (First Name / Full Name), Text Mentions (when tagged without a username), and User ID.
+
+Please update the `extract_user` function in Pyrogram to handle all these scenarios seamlessly:
+
+```python
+async def extract_user(client, message):
+    # 1. Priority 1: Reply to a message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+
+    # 2. Priority 2: Extract from Telegram Entities (TEXT_MENTION for users without @username, or standard MENTION)
+    if message.entities:
+        for entity in message.entities:
+            # User mentioned directly by Telegram tag (works even without username)
+            if entity.type.name == "TEXT_MENTION" and entity.user:
+                return entity.user
+            
+            # Username tag (@username)
+            elif entity.type.name == "MENTION":
+                username = message.text[entity.offset : entity.offset + entity.length].replace("@", "").strip()
+                try:
+                    return await client.get_users(username)
+                except Exception:
+                    async for member in client.get_chat_members(message.chat.id):
+                        if member.user and member.user.username and member.user.username.lower() == username.lower():
+                            return member.user
+
+    # 3. Priority 3: Extract from message text (Search by Display Name, Username, or ID)
+    # Remove command prefix (like كتم, /mute, بان) from the message
+    command_words = ["كتم", "/mute", "بان", "حظر", "/ban", "طرد", "/kick"]
+    search_query = message.text
+    for cmd in command_words:
+        search_query = search_query.replace(cmd, "").strip()
+
+    if search_query:
+        # Check if search query is numeric User ID
+        if search_query.isdigit():
+            try:
+                return await client.get_users(int(search_query))
+            except Exception:
+                pass
+
+        # Search group members by First Name / Full Name / Username
+        search_query_lower = search_query.lower()
+        async for member in client.get_chat_members(message.chat.id):
+            if member.user:
+                first_name = (member.user.first_name or "").lower()
+                last_name = (member.user.last_name or "").lower()
+                full_name = f"{first_name} {last_name}".strip()
+
+                if search_query_lower in full_name or search_query_lower in first_name:
+                    return member.user
+
+    return None

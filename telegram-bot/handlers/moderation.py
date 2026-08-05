@@ -37,6 +37,55 @@ from telegram.error import TelegramError
 
 logger = logging.getLogger(__name__)
 
+# ── Member cache ──────────────────────────────────────────────────────────────
+# Bot API has no get_chat_members() equivalent. We build a per-chat cache
+# organically: every message sent in a group stores the sender. Moderation
+# commands can then search this cache by first name / full name.
+# Structure: { chat_id: { user_id: User } }
+_member_cache: dict[int, dict] = {}
+
+
+def _cache_user(chat_id: int, user) -> None:
+    """Store *user* in the cache for *chat_id*."""
+    if not user or not user.id:
+        return
+    _member_cache.setdefault(chat_id, {})[user.id] = user
+
+
+def _cache_search_username(chat_id: int, username: str):
+    """Return a cached user whose username matches (case-insensitive), or None."""
+    uname_lower = username.lower()
+    for user in _member_cache.get(chat_id, {}).values():
+        if (user.username or "").lower() == uname_lower:
+            return user
+    return None
+
+
+def _cache_search_name(chat_id: int, query: str):
+    """
+    Return the first cached user whose first name or full name
+    contains *query* (case-insensitive), or None.
+    """
+    q = query.lower()
+    for user in _member_cache.get(chat_id, {}).values():
+        first = (getattr(user, "first_name", None) or "").lower()
+        last  = (getattr(user, "last_name",  None) or "").lower()
+        full  = f"{first} {last}".strip()
+        if q in full or q in first:
+            return user
+    return None
+
+
+async def update_member_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    MessageHandler that silently caches every group message sender.
+    Registered with a low priority so it never interferes with other handlers.
+    """
+    msg = update.message
+    if msg and msg.from_user:
+        _cache_user(msg.chat.id, msg.from_user)
+
+
 # ── Arabic trigger patterns ────────────────────────────────────────────────────
 
 _AR_BAN    = re.compile(r"^(بان|حظر)\b")
@@ -66,29 +115,32 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
 
 async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Resolve the target user from the incoming message.
-
-    Supports: `كتم @username` or `/mute @username` (command FIRST, mention AFTER).
+    Resolve the moderation target — works for users WITH and WITHOUT a @username.
 
     Priority 1 — Reply:
-        reply_to_message.from_user — always reliable, zero parsing.
+        reply_to_message.from_user. Always reliable, zero parsing needed.
 
-    Priority 2 — Entity scan:
-        message.entities gives exact byte-offset data unaffected by Unicode
-        BiDi reordering. Handles MENTION (@username) and TEXT_MENTION (users
-        without a public username). This is the most reliable path for mentions.
+    Priority 2 — Entity scan (TEXT_MENTION + MENTION):
+        TEXT_MENTION: Telegram embeds the User object directly — the only
+            reliable way to target users who have no @username set.
+        MENTION: parse_entity() extracts the @username using UTF-16 offsets,
+            immune to Arabic BiDi reordering. Falls back to member cache search
+            if the Bot API can't resolve the username (e.g. privacy settings).
 
-    Priority 3 — Text split with BiDi stripping:
-        Split on whitespace and check every token after stripping invisible
-        Unicode bidirectional control characters (U+200B..U+200F, U+202A..
-        U+202E, U+2066..U+2069, U+FEFF) that Telegram inserts around Latin
-        text (like @username) inside an Arabic RTL message. Without stripping,
-        part.startswith("@") silently fails even when the @ is visually there.
+    Priority 3 — Text search after stripping the command word:
+        Remove the trigger (كتم, /mute, بان…) from the raw text, then check
+        the remainder:
+          • @username    → Bot API lookup, then cache fallback
+          • all-digits   → numeric user-ID lookup
+          • anything else → display-name search in the member cache
+            (cache is filled organically by update_member_cache handler)
+        BiDi control characters (U+200B–U+200F, U+202A–U+202E, etc.) are
+        stripped from every token before comparison.
     """
     msg = update.message
 
-    # Invisible Unicode chars Telegram may inject around LTR text in RTL context
-    _BIDI_CHARS = (
+    # Invisible Unicode chars Telegram injects around LTR text in RTL context
+    _BIDI = (
         "\u200b\u200c\u200d\u200e\u200f"
         "\u202a\u202b\u202c\u202d\u202e"
         "\u2066\u2067\u2068\u2069\ufeff"
@@ -100,38 +152,71 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Priority 2: entity scan ───────────────────────────────────────────────
     for entity in msg.entities or []:
-        if entity.type == "mention":
-            # parse_entity() applies the API's UTF-16 offsets correctly —
-            # Arabic chars before @username don't shift the slice.
-            raw = msg.parse_entity(entity)          # e.g. "@username"
-            username = raw.lstrip("@").strip(_BIDI_CHARS).strip()
-            if username:
-                try:
-                    return await context.bot.get_chat(f"@{username}")
-                except Exception as exc:
-                    logger.debug("entity MENTION @%s failed: %s", username, exc)
-        elif entity.type == "text_mention" and entity.user:
-            return entity.user  # user object embedded directly (no username)
 
-    # ── Priority 3: text split with BiDi stripping ───────────────────────────
-    text_parts = msg.text.split() if msg.text else []
-    for part in text_parts:
-        # Strip invisible BiDi control chars before checking the token
-        clean = part.strip(_BIDI_CHARS)
-        if clean.startswith("@"):
-            username = clean.lstrip("@").strip(_BIDI_CHARS).strip()
-            if username:
-                try:
-                    return await context.bot.get_chat(f"@{username}")
-                except Exception as exc:
-                    logger.debug("split @%s failed: %s", username, exc)
-                    continue
-        elif clean.isdigit():
-            try:
-                return await context.bot.get_chat(int(clean))
-            except Exception as exc:
-                logger.debug("split id %s failed: %s", clean, exc)
+        # TEXT_MENTION — user without @username; Telegram embeds User directly
+        if entity.type == "text_mention" and entity.user:
+            return entity.user
+
+        # MENTION — @username present in text
+        if entity.type == "mention":
+            raw      = msg.parse_entity(entity)            # e.g. "@username"
+            username = raw.lstrip("@").strip(_BIDI).strip()
+            if not username:
                 continue
+            try:
+                return await context.bot.get_chat(f"@{username}")
+            except Exception as exc:
+                logger.debug("entity MENTION @%s API failed: %s — trying cache", username, exc)
+                # Fallback: maybe the user is in our member cache
+                cached = _cache_search_username(msg.chat.id, username)
+                if cached:
+                    return cached
+
+    # ── Priority 3: text search after stripping command word ──────────────────
+    # Remove the trigger word / command so what remains is the search query.
+    _COMMANDS = [
+        "الغاء الكتم", "الغاء كتم",
+        "الغاء الحظر", "الغاء بان",
+        "كتم", "بان", "حظر", "طرد",
+        "/unmute", "/unban", "/mute", "/ban", "/kick",
+    ]
+    search_query = (msg.text or "").strip(_BIDI)
+    for cmd in _COMMANDS:
+        if search_query.startswith(cmd):
+            search_query = search_query[len(cmd):].strip(_BIDI).strip()
+            break
+
+    if not search_query:
+        return None
+
+    # Strip BiDi chars from the whole query too
+    search_query = search_query.strip(_BIDI).strip()
+
+    # @username
+    if search_query.startswith("@"):
+        username = search_query.lstrip("@").strip(_BIDI).strip()
+        if username:
+            try:
+                return await context.bot.get_chat(f"@{username}")
+            except Exception as exc:
+                logger.debug("text @%s API failed: %s — trying cache", username, exc)
+                cached = _cache_search_username(msg.chat.id, username)
+                if cached:
+                    return cached
+
+    # Numeric user-ID
+    elif search_query.isdigit():
+        try:
+            return await context.bot.get_chat(int(search_query))
+        except Exception as exc:
+            logger.debug("text user-id %s failed: %s", search_query, exc)
+
+    # Display-name search in member cache (users without @username)
+    else:
+        found = _cache_search_name(msg.chat.id, search_query)
+        if found:
+            logger.debug("Resolved '%s' via name cache → %s", search_query, found.id)
+            return found
 
     return None
 
@@ -413,3 +498,10 @@ def register(app: Application) -> None:
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(_cb_unmute, pattern=r"^unmute_\d+$"))
     app.add_handler(CallbackQueryHandler(_cb_unban,  pattern=r"^unban_\d+$"))
+
+    # Member cache — runs on EVERY group message (group=-1 = lowest priority,
+    # so it never blocks moderation handlers from running first)
+    app.add_handler(
+        MessageHandler(group_filter & filters.ALL, update_member_cache),
+        group=-1,
+    )
