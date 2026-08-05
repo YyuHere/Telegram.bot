@@ -621,8 +621,8 @@ async def _handle_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     else:
         result = (
-            f"✅ تمت مزامنة المشرفين ({count} عضو).\n"
-            f"⚠️ للمزامنة الكاملة لجميع الأعضاء، أضف `ASSISTANT_SESSION_STRING` إلى الإعدادات."
+            f"✅ تمت مزامنة {count} مشرف في قاعدة البيانات.\n"
+            f"_(الأعضاء العاديون يُضافون تلقائياً عند نشاطهم)_"
         )
 
     await status_msg.edit_text(result, parse_mode="Markdown")
