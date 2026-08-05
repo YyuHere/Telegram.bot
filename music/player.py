@@ -277,9 +277,29 @@ def _strip_tashkeel(text: str) -> str:
     return _TASHKEEL_RE.sub("", text).strip()
 
 
+# Hostnames that unambiguously identify a platform URL even without a scheme.
+_PLATFORM_HOSTS = (
+    "youtube.com", "youtu.be", "www.youtube.com",
+    "music.youtube.com", "m.youtube.com",
+    "soundcloud.com", "www.soundcloud.com", "on.soundcloud.com",
+    "spotify.com", "open.spotify.com",
+)
+
+
 def _is_url(text: str) -> bool:
-    """Return True if *text* looks like a direct URL rather than a search query."""
-    return text.startswith(("http://", "https://", "www."))
+    """
+    Return True if *text* is a URL rather than a search query.
+
+    Accepts:
+      • Any string starting with ``http://``, ``https://``, or ``www.``
+      • Bare platform hostnames (youtu.be/…, youtube.com/…, soundcloud.com/…)
+        so users don't have to type the scheme.
+    """
+    if text.startswith(("http://", "https://", "www.")):
+        return True
+    # Check for bare platform hostnames (no scheme prefix)
+    lower = text.lower()
+    return any(lower.startswith(host + "/") or lower == host for host in _PLATFORM_HOSTS)
 
 
 # Common audio-file extensions whose URLs can be piped directly into pytgcalls
@@ -395,38 +415,39 @@ def get_audio_info(query: str) -> TrackInfo:
 
     # ── Direct URL ────────────────────────────────────────────────────────────
     if _is_url(query):
-        # Raw audio file — skip yt-dlp entirely, pipe directly to pytgcalls.
-        if _is_direct_audio_url(query):
-            filename = query.split("/")[-1].split("?")[0] or query
-            logger.info("yt-dlp: direct audio URL — skipping extraction for %r", filename)
-            return TrackInfo(url=query, title=filename, duration="0:00", thumbnail="")
+        # Normalise bare hostnames → add https:// so yt-dlp can handle them.
+        url = query if query.startswith(("http://", "https://")) else f"https://{query}"
 
-        # Attempt yt-dlp extraction; fall back to raw URL on any failure.
+        # Raw audio file (.mp3 / .opus / etc.) — skip yt-dlp entirely and pipe
+        # the URL directly to pytgcalls/ffmpeg which handles them natively.
+        if _is_direct_audio_url(url):
+            filename = url.split("/")[-1].split("?")[0] or url
+            logger.info("yt-dlp: direct audio file URL — skipping extraction: %r", filename)
+            return TrackInfo(url=url, title=filename, duration="0:00", thumbnail="")
+
+        # Platform URL (YouTube, SoundCloud, etc.) — must go through yt-dlp to
+        # obtain a real CDN streaming URL.  Passing the page URL directly to
+        # ffmpeg/pytgcalls causes [Errno 2] No such file or directory because
+        # ffmpeg cannot open an HTML page as audio.
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-            track = _extract_first_valid(info, query)
+                info = ydl.extract_info(url, download=False)
+            track = _extract_first_valid(info, url)
             if track:
                 return track
+            raise RuntimeError("لم يُعثر على رابط تدفق صالح في هذا الرابط.")
+        except RuntimeError:
+            raise
         except Exception as exc:
             err_lower = str(exc).lower()
             if any(p in err_lower for p in _BOT_CHECK_PHRASES):
-                logger.warning(
-                    "yt-dlp: YouTube bot-check triggered for URL %r — "
-                    "falling back to direct stream: %s", query, exc
-                )
-            else:
-                logger.warning(
-                    "yt-dlp: extraction failed for URL %r — "
-                    "falling back to direct stream: %s", query, exc
-                )
-            # Return the original URL directly so pytgcalls can still try.
-            filename = query.split("/")[-1].split("?")[0] or query
-            return TrackInfo(url=query, title=filename, duration="0:00", thumbnail="")
-
-        # Extraction returned no usable URL — last-resort direct pass-through.
-        logger.warning("yt-dlp: no usable URL extracted from %r — using raw URL", query)
-        return TrackInfo(url=query, title=query, duration="0:00", thumbnail="")
+                raise RuntimeError(
+                    "❌ يوتيوب يطلب تسجيل الدخول للتحقق (Bot Detection).\n"
+                    "جرّب رابط SoundCloud بدلاً من ذلك، أو فعّل YTDLP_COOKIES_FILE."
+                ) from exc
+            raise RuntimeError(
+                f"❌ فشل استخراج الصوت من الرابط:\n{exc}"
+            ) from exc
 
     # ── Staged text search ────────────────────────────────────────────────────
     _bot_check_hit = False
