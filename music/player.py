@@ -197,21 +197,12 @@ async def ensure_pytgcalls_started() -> None:
 
 def _ydl_opts() -> dict:
     """
-    Build yt-dlp options that avoid YouTube's "Sign in to confirm you're not
-    a bot" block on headless / server environments (Railway, Replit, VPS).
+    Build yt-dlp options for SoundCloud search and generic URL extraction.
 
-    Strategy (in priority order):
-      1. iOS player client     — yt-dlp's ``ios`` InnerTube client bypasses
-         the bot-challenge gate reliably on server IPs.  ``tv_embedded`` and
-         ``web`` are kept as ordered fallbacks so yt-dlp automatically retries
-         them when ``ios`` is throttled or token-expired.
-      2. Cookie file fallback  — If YTDLP_COOKIES_FILE is set in the
-         environment (path to a Netscape-format cookies.txt exported from a
-         logged-in browser), those cookies are attached for extra resilience on
-         heavily rate-limited datacenter IPs.
-
-    The iOS client trick is sufficient in the vast majority of cases;
-    the cookie file is an optional belt-and-suspenders measure.
+    YouTube is intentionally excluded — SoundCloud has no bot-detection gate
+    and carries a strong Arabic/regional catalogue that covers the vast majority
+    of user requests.  Generic ``http(s)://`` URLs (direct audio files, other
+    yt-dlp-supported platforms) are also handled.
     """
     import os
 
@@ -220,35 +211,22 @@ def _ydl_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # iOS client is the most reliable bypass for YouTube's "Sign in to
-        # confirm you're not a bot" gate on headless/server IPs (2025+).
-        # tv_embedded and web serve as automatic fallbacks inside yt-dlp.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "tv_embedded", "web"],
-            }
-        },
-        # iOS-style User-Agent matches the ios player_client identity.
+        # Generic browser User-Agent — works for SoundCloud and most other
+        # yt-dlp extractors without requiring platform-specific client IDs.
         "http_headers": {
             "User-Agent": (
-                "com.google.ios.youtube/19.29.1 "
-                "(iPhone16,2; U; CPU iPhone OS 17_5_1 like Mac OS X)"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
             ),
         },
     }
 
-    # Optional: path to a Netscape cookies.txt file exported from a browser.
-    # Set YTDLP_COOKIES_FILE in Replit/Railway Secrets if the iOS client alone
-    # is blocked on your IP (e.g. heavily shared datacenter addresses).
+    # Optional cookie file for any platform that requires authentication.
     cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if cookie_file and os.path.isfile(cookie_file):
         opts["cookiefile"] = cookie_file
         logger.debug("yt-dlp: using cookie file %s", cookie_file)
-    else:
-        logger.debug(
-            "yt-dlp: no YTDLP_COOKIES_FILE set (or file not found) — "
-            "relying on iOS client bypass"
-        )
 
     return opts
 
@@ -267,7 +245,7 @@ import re as _re
 # ─── Arabic text helpers ──────────────────────────────────────────────────────
 
 # Unicode ranges for Arabic diacritical marks (tashkeel / harakat).
-# These are present in Quranic/formal text but absent from YouTube titles,
+# These are present in Quranic/formal text but absent from SoundCloud titles,
 # so stripping them dramatically improves search hit-rates.
 _TASHKEEL_RE = _re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]")
 
@@ -278,11 +256,13 @@ def _strip_tashkeel(text: str) -> str:
 
 
 # Hostnames that unambiguously identify a platform URL even without a scheme.
+# YouTube is intentionally absent — it is no longer supported.
 _PLATFORM_HOSTS = (
-    "youtube.com", "youtu.be", "www.youtube.com",
-    "music.youtube.com", "m.youtube.com",
     "soundcloud.com", "www.soundcloud.com", "on.soundcloud.com",
     "spotify.com", "open.spotify.com",
+    "mixcloud.com", "www.mixcloud.com",
+    "bandcamp.com",
+    "deezer.com", "www.deezer.com",
 )
 
 
@@ -292,7 +272,7 @@ def _is_url(text: str) -> bool:
 
     Accepts:
       • Any string starting with ``http://``, ``https://``, or ``www.``
-      • Bare platform hostnames (youtu.be/…, youtube.com/…, soundcloud.com/…)
+      • Bare platform hostnames (soundcloud.com/…, etc.)
         so users don't have to type the scheme.
     """
     if text.startswith(("http://", "https://", "www.")):
@@ -313,14 +293,17 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
-# yt-dlp error substrings that indicate YouTube's bot-check / sign-in gate.
-_BOT_CHECK_PHRASES = (
+# yt-dlp error substrings that indicate an extraction / access failure.
+_EXTRACTION_ERROR_PHRASES = (
     "sign in to confirm",
     "confirm you're not a bot",
     "confirm you are not a bot",
     "bot detection",
-    "this video is not available",   # common disguise for geo/bot blocks
+    "this video is not available",
     "video unavailable",
+    "private track",
+    "content not available",
+    "geo restriction",
 )
 
 
@@ -329,13 +312,14 @@ def _search_variants(query: str) -> list[tuple[str, str]]:
     Return a prioritized list of ``(yt-dlp-prefix, query_string)`` pairs that
     ``get_audio_info`` will try in order until one succeeds.
 
+    YouTube is excluded entirely.  SoundCloud is the primary search platform:
+    it has no bot-detection gate, is fully supported by yt-dlp, and carries a
+    large Arabic/regional catalogue.
+
     Pipeline:
-      1. YouTube  — original query, 5 candidates
-      2. SoundCloud — original query, 5 candidates
-      3. YouTube  — tashkeel-stripped query (only added when it differs)
-      4. SoundCloud — tashkeel-stripped query
-      5. YouTube  — first 4 words of original (only added for long queries)
-      6. SoundCloud — first 4 words
+      1. SoundCloud — original query, 5 candidates
+      2. SoundCloud — tashkeel-stripped query (only added when it differs)
+      3. SoundCloud — first 4 words of original (only for long queries)
 
     Duplicates are suppressed so the same string is never tried twice.
     """
@@ -352,15 +336,12 @@ def _search_variants(query: str) -> list[tuple[str, str]]:
     words = query.split()
     short = " ".join(words[:4]) if len(words) > 4 else ""
 
-    _add("ytsearch5", query)
     _add("scsearch5", query)
 
     if normalized != query:
-        _add("ytsearch5", normalized)
         _add("scsearch5", normalized)
 
     if short and short != query:
-        _add("ytsearch5", short)
         _add("scsearch5", short)
 
     return variants
@@ -393,20 +374,17 @@ def get_audio_info(query: str) -> TrackInfo:
     """
     Resolve *query* (song name or direct URL) via yt-dlp.
 
-    Direct URLs (http/https/www) are resolved immediately without any search.
-    If the URL points to a raw audio file (.mp3, .opus, etc.) it is returned
-    as-is without calling yt-dlp.  If yt-dlp extraction fails for any direct
-    URL, the URL is returned directly so pytgcalls can still attempt to play it.
+    Text queries are searched on SoundCloud (no bot-detection, strong Arabic
+    catalogue).  YouTube is intentionally excluded.
 
-    For text queries the function walks through a staged fallback pipeline
+    Direct URLs (http/https/www or bare platform hostnames) bypass search:
+      • Raw audio files (.mp3, .opus, etc.) are piped directly to pytgcalls.
+      • All other URLs go through yt-dlp to obtain a real CDN streaming URL.
+
+    For text queries the function walks a staged fallback pipeline
     (see ``_search_variants``) that handles:
-
-      • Arabic diacritics (tashkeel) — stripped before retrying so that e.g.
-        "أُغنِيَّة" and "اغنية" both match the same YouTube result.
-      • Long multi-word titles — retried with only the first 4 words when the
-        full phrase returns nothing.
-      • YouTube bot-blocking — SoundCloud is tried in parallel at each stage
-        since it has no bot-check and carries a strong Arabic/regional catalogue.
+      • Arabic diacritics (tashkeel) — stripped before retrying.
+      • Long multi-word titles — retried with the first 4 words.
 
     Returns a TrackInfo dict: url, title, duration (m:ss), thumbnail URL.
     Raises RuntimeError with an Arabic-language message if all stages fail.
@@ -440,17 +418,16 @@ def get_audio_info(query: str) -> TrackInfo:
             raise
         except Exception as exc:
             err_lower = str(exc).lower()
-            if any(p in err_lower for p in _BOT_CHECK_PHRASES):
+            if any(p in err_lower for p in _EXTRACTION_ERROR_PHRASES):
                 raise RuntimeError(
-                    "❌ يوتيوب يطلب تسجيل الدخول للتحقق (Bot Detection).\n"
-                    "جرّب رابط SoundCloud بدلاً من ذلك، أو فعّل YTDLP_COOKIES_FILE."
+                    "❌ تعذّر الوصول إلى هذا الرابط (محتوى خاص أو مقيّد).\n"
+                    "جرّب رابط SoundCloud مباشرًا بدلاً من ذلك."
                 ) from exc
             raise RuntimeError(
                 f"❌ فشل استخراج الصوت من الرابط:\n{exc}"
             ) from exc
 
-    # ── Staged text search ────────────────────────────────────────────────────
-    _bot_check_hit = False
+    # ── Staged text search (SoundCloud only) ──────────────────────────────────
     for prefix, variant in _search_variants(query):
         search_str = f"{prefix}:{variant}"
         logger.debug("yt-dlp: trying %r", search_str)
@@ -465,26 +442,11 @@ def get_audio_info(query: str) -> TrackInfo:
                 )
                 return track
         except Exception as exc:
-            err_lower = str(exc).lower()
-            if any(p in err_lower for p in _BOT_CHECK_PHRASES):
-                _bot_check_hit = True
-                logger.warning(
-                    "yt-dlp: YouTube bot-check triggered for %r: %s", search_str, exc
-                )
-            else:
-                logger.warning("yt-dlp: %r failed: %s", search_str, exc)
-
-    if _bot_check_hit:
-        raise RuntimeError(
-            "❌ يوتيوب يطلب تسجيل الدخول للتحقق (Bot Detection).\n"
-            "أرسل رابط YouTube مباشرًا، أو جرّب SoundCloud:\n"
-            "مثال: تشغيل scsearch: اسم الأغنية\n"
-            "أو فعّل YTDLP_COOKIES_FILE في إعدادات البوت."
-        )
+            logger.warning("yt-dlp: %r failed: %s", search_str, exc)
 
     raise RuntimeError(
-        f"لم يتم العثور على نتائج لـ: {query!r}\n"
-        "جرّب اسمًا آخر للأغنية أو أرسل رابط YouTube / SoundCloud مباشرًا."
+        f"❌ لم يتم العثور على نتائج في SoundCloud لـ: {query!r}\n"
+        "جرّب اسمًا آخر للأغنية، أو أرسل رابط SoundCloud مباشرًا."
     )
 
 

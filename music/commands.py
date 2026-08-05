@@ -5,7 +5,9 @@ Triggers:
   • /play <query>  — slash command
   • تشغيل <query> — Arabic text trigger
 
-Response: YouTube thumbnail photo + formatted caption + inline playback keyboard.
+Search: SoundCloud (primary). Direct audio URLs and other yt-dlp-supported
+        platform links are also accepted. YouTube is intentionally excluded.
+Response: Thumbnail photo + formatted caption + inline playback keyboard.
 Callbacks: ▶️ ⏸️ 🔄 ⏭️ ⏹️ buttons wired to PyTgCalls controls.
 """
 
