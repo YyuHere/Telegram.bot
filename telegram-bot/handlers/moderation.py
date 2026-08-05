@@ -4,14 +4,14 @@ handlers/moderation.py — Group administration & moderation commands.
 Supports both Arabic text triggers and English slash commands.
 All actions are admin-only and protected against targeting other admins or the bot.
 
-Arabic triggers (can be sent as standalone text or reply):
+Arabic triggers (standalone text OR as a reply):
   بان / حظر              → Ban
   الغاء الحظر / الغاء بان → Unban
-  طرد                    → Kick (ban + immediate unban)
+  طرد                    → Kick (ban + immediate unban so they can rejoin)
   كتم                    → Mute
   الغاء الكتم / الغاء كتم → Unmute
 
-English slash commands (reply to a message OR include @username):
+English slash commands (reply to a message OR include @username / user_id):
   /ban, /unban, /kick, /mute, /unmute
 """
 
@@ -30,8 +30,7 @@ from telegram.error import TelegramError
 logger = logging.getLogger(__name__)
 
 # ── Arabic trigger patterns ────────────────────────────────────────────────────
-# Each pattern anchors to the start of the message so casual mentions
-# of these words mid-sentence don't accidentally trigger moderation.
+# Anchored to the START of the message so casual mid-sentence mentions are ignored.
 
 _AR_BAN    = re.compile(r"^(بان|حظر)\b", re.IGNORECASE)
 _AR_UNBAN  = re.compile(r"^(الغاء\s+الحظر|الغاء\s+بان)\b", re.IGNORECASE)
@@ -39,13 +38,15 @@ _AR_KICK   = re.compile(r"^طرد\b", re.IGNORECASE)
 _AR_MUTE   = re.compile(r"^كتم\b", re.IGNORECASE)
 _AR_UNMUTE = re.compile(r"^(الغاء\s+الكتم|الغاء\s+كتم)\b", re.IGNORECASE)
 
-# Combined filter: any message that starts with one of the Arabic triggers
 _AR_MOD_FILTER = filters.Regex(
     re.compile(
         r"^(بان|حظر|الغاء\s+الحظر|الغاء\s+بان|طرد|كتم|الغاء\s+الكتم|الغاء\s+كتم)\b",
         re.IGNORECASE,
     )
 )
+
+# Regex to find @username anywhere in plain text (Latin letters / digits / underscore)
+_MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{3,31})")
 
 # ── Permission helpers ─────────────────────────────────────────────────────────
 
@@ -65,101 +66,115 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Resolve the moderation target user from the update.
 
-    Priority:
+    Resolution order (most-reliable first):
       1. Replied-to message author.
-      2. @username or user-id in the command/text arguments.
+      2. Telegram `mention` entity — uses parse_entity() which correctly handles
+         UTF-16 offsets, so Arabic text before @username doesn't corrupt the slice.
+      3. Telegram `text_mention` entity (tappable name for users without a username).
+      4. Regex search for @username anywhere in the raw text (safety fallback).
+      5. Bare numeric user-ID in the text.
 
-    Returns a telegram.User object or None if no target found.
+    Returns a User/Chat object with .id and .first_name, or None.
     """
     msg = update.message
 
-    # 1. Reply-to
+    # ── 1. Reply-to ───────────────────────────────────────────────────────────
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
 
-    # 2. Extract from text — grab first entity of type mention or the first arg
-    if msg.entities:
-        for entity in msg.entities:
-            if entity.type == "mention":
-                username = msg.text[entity.offset + 1: entity.offset + entity.length]
+    # ── 2 & 3. Entity scan ───────────────────────────────────────────────────
+    # parse_entity() uses the Bot API's UTF-16 offset/length correctly, meaning
+    # Arabic characters (which are multi-byte in UTF-16) before a @mention will
+    # not shift the slice and produce a garbled result.
+    for entity in msg.entities or []:
+        if entity.type == "mention":
+            raw = msg.parse_entity(entity)        # e.g. "@username"
+            username = raw.lstrip("@").strip()
+            if username:
                 try:
-                    chat = await context.bot.get_chat(f"@{username}")
-                    return chat  # Chat object has .id and .first_name like User
-                except TelegramError:
-                    pass
-            elif entity.type == "text_mention" and entity.user:
-                return entity.user
+                    return await context.bot.get_chat(f"@{username}")
+                except TelegramError as exc:
+                    logger.debug("Could not resolve @%s: %s", username, exc)
 
-    # 3. Try bare numeric user-id in arguments
-    args = context.args or []
-    if args:
+        elif entity.type == "text_mention" and entity.user:
+            # Users without a public username are referenced via text_mention
+            return entity.user
+
+    # ── 4. Regex fallback ─────────────────────────────────────────────────────
+    # Handles edge cases: Telegram occasionally omits mention entities for
+    # some clients, or the username is typed without triggering an entity.
+    text = msg.text or msg.caption or ""
+    m = _MENTION_RE.search(text)
+    if m:
+        username = m.group(1).strip()
         try:
-            uid = int(args[0])
-            chat = await context.bot.get_chat(uid)
-            return chat
-        except (ValueError, TelegramError):
+            return await context.bot.get_chat(f"@{username}")
+        except TelegramError as exc:
+            logger.debug("Regex fallback: could not resolve @%s: %s", username, exc)
+
+    # ── 5. Bare numeric user-ID ───────────────────────────────────────────────
+    # Useful when an admin types: بان 123456789
+    num_match = re.search(r"\b(\d{5,12})\b", text)
+    if num_match:
+        try:
+            uid = int(num_match.group(1))
+            return await context.bot.get_chat(uid)
+        except TelegramError:
             pass
 
     return None
 
 
-async def _check_preconditions(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> tuple:
-    """
-    Verify that:
-      - The command is used inside a group / supergroup.
-      - The invoker is an admin or creator.
-      - A valid target is specified.
-      - The target is not an admin, creator, or the bot itself.
+# ── Pre-condition guard ────────────────────────────────────────────────────────
 
-    Returns (target_user, None) on success, or (None, error_message) on failure.
+async def _check_preconditions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Verify:
+      - Command is used inside a group / supergroup.
+      - Invoker is an admin or group creator.
+      - A valid target can be resolved.
+      - Target is not an admin, creator, or the bot itself.
+
+    Returns (target, None) on success or (None, error_str) on failure.
     """
     msg = update.message
     chat = msg.chat
     invoker = msg.from_user
     bot_user = await context.bot.get_me()
 
-    # Must be in a group
     if chat.type not in ("group", "supergroup"):
-        return None, "⚠️ هذا الأمر يعمل فقط في المجموعات.\n_This command only works in groups._"
+        return None, "⚠️ هذا الأمر يعمل فقط داخل المجموعات.\n_This command only works in groups._"
 
-    # Invoker must be admin
     if not await _is_admin(context.bot, chat.id, invoker.id):
         return None, "🚫 هذا الأمر للمشرفين فقط.\n_Only group admins can use this command._"
 
-    # Resolve target
     target = await _get_target(update, context)
     if target is None:
         return None, (
             "❓ لم يتم تحديد المستخدم.\n"
-            "_Please reply to a message or mention a user: `@username`_"
+            "_Reply to their message, or write:_ `الأمر @username`"
         )
 
-    # Cannot target the bot itself
     if target.id == bot_user.id:
         return None, "😅 لا أستطيع تطبيق هذا الأمر على نفسي!\n_I can't apply this to myself!_"
 
-    # Cannot target another admin
     if await _is_admin(context.bot, chat.id, target.id):
-        return None, "🛡 لا يمكن تطبيق هذا الأمر على المشرفين.\n_You cannot use this command on an admin._"
+        return None, "🛡 لا يمكن تطبيق هذا الأمر على المشرفين.\n_You cannot target an admin with this command._"
 
     return target, None
 
 
-def _user_mention(user) -> str:
-    """Return a Markdown-safe mention or name for *user*."""
+def _mention(user) -> str:
+    """Build a Markdown inline mention for *user*."""
     name = getattr(user, "first_name", None) or getattr(user, "username", None) or str(user.id)
-    if getattr(user, "username", None):
-        return f"[{name}](tg://user?id={user.id})"
-    return name
+    # Escape special MarkdownV1 chars in the name
+    name = name.replace("[", "\\[").replace("`", "\\`")
+    return f"[{name}](tg://user?id={user.id})"
 
 
-# ── Action handlers ────────────────────────────────────────────────────────────
+# ── Individual action handlers ─────────────────────────────────────────────────
 
 async def _handle_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ban a user from the group permanently."""
     target, err = await _check_preconditions(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="Markdown")
@@ -167,17 +182,15 @@ async def _handle_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await context.bot.ban_chat_member(update.message.chat.id, target.id)
         await update.message.reply_text(
-            f"🔨 تم حظر {_user_mention(target)} من المجموعة.\n"
-            f"_User has been banned._",
+            f"🔨 تم حظر {_mention(target)} من المجموعة.\n_User has been banned._",
             parse_mode="Markdown",
         )
         logger.info("Banned user %s in chat %s", target.id, update.message.chat.id)
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ فشل الأمر: `{e}`", parse_mode="Markdown")
+    except TelegramError as exc:
+        await update.message.reply_text(f"❌ فشل الأمر: `{exc}`", parse_mode="Markdown")
 
 
 async def _handle_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unban a previously banned user (they can rejoin via invite)."""
     target, err = await _check_preconditions(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="Markdown")
@@ -185,17 +198,15 @@ async def _handle_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await context.bot.unban_chat_member(update.message.chat.id, target.id, only_if_banned=True)
         await update.message.reply_text(
-            f"✅ تم رفع الحظر عن {_user_mention(target)}.\n"
-            f"_User has been unbanned._",
+            f"✅ تم رفع الحظر عن {_mention(target)}.\n_User has been unbanned._",
             parse_mode="Markdown",
         )
         logger.info("Unbanned user %s in chat %s", target.id, update.message.chat.id)
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ فشل الأمر: `{e}`", parse_mode="Markdown")
+    except TelegramError as exc:
+        await update.message.reply_text(f"❌ فشل الأمر: `{exc}`", parse_mode="Markdown")
 
 
 async def _handle_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Kick a user (ban then immediately unban — they can rejoin via invite link)."""
     target, err = await _check_preconditions(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="Markdown")
@@ -204,17 +215,16 @@ async def _handle_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.ban_chat_member(update.message.chat.id, target.id)
         await context.bot.unban_chat_member(update.message.chat.id, target.id)
         await update.message.reply_text(
-            f"👢 تم طرد {_user_mention(target)} من المجموعة.\n"
-            f"_User has been kicked. They can rejoin via invite link._",
+            f"👢 تم طرد {_mention(target)} من المجموعة.\n"
+            f"_User has been kicked. They may rejoin via invite link._",
             parse_mode="Markdown",
         )
         logger.info("Kicked user %s in chat %s", target.id, update.message.chat.id)
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ فشل الأمر: `{e}`", parse_mode="Markdown")
+    except TelegramError as exc:
+        await update.message.reply_text(f"❌ فشل الأمر: `{exc}`", parse_mode="Markdown")
 
 
 async def _handle_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mute a user — restrict all messaging permissions."""
     target, err = await _check_preconditions(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="Markdown")
@@ -234,23 +244,20 @@ async def _handle_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             ),
         )
         await update.message.reply_text(
-            f"🔇 تم كتم {_user_mention(target)}.\n"
-            f"_User has been muted._",
+            f"🔇 تم كتم {_mention(target)}.\n_User has been muted._",
             parse_mode="Markdown",
         )
         logger.info("Muted user %s in chat %s", target.id, update.message.chat.id)
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ فشل الأمر: `{e}`", parse_mode="Markdown")
+    except TelegramError as exc:
+        await update.message.reply_text(f"❌ فشل الأمر: `{exc}`", parse_mode="Markdown")
 
 
 async def _handle_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unmute a user — restore default group permissions."""
     target, err = await _check_preconditions(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="Markdown")
         return
     try:
-        # Restore the group's default permissions by passing can_send_messages=True
         await context.bot.restrict_chat_member(
             update.message.chat.id,
             target.id,
@@ -265,22 +272,18 @@ async def _handle_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ),
         )
         await update.message.reply_text(
-            f"🔊 تم إلغاء كتم {_user_mention(target)}.\n"
-            f"_User has been unmuted._",
+            f"🔊 تم إلغاء كتم {_mention(target)}.\n_User has been unmuted._",
             parse_mode="Markdown",
         )
         logger.info("Unmuted user %s in chat %s", target.id, update.message.chat.id)
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ فشل الأمر: `{e}`", parse_mode="Markdown")
+    except TelegramError as exc:
+        await update.message.reply_text(f"❌ فشل الأمر: `{exc}`", parse_mode="Markdown")
 
 
-# ── Arabic text trigger dispatcher ────────────────────────────────────────────
+# ── Arabic trigger dispatcher ──────────────────────────────────────────────────
 
 async def arabic_trigger_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Dispatch Arabic trigger words to the appropriate moderation action.
-    Called for any group message that starts with a recognised Arabic trigger.
-    """
+    """Route Arabic trigger words to the matching action handler."""
     text = (update.message.text or "").strip()
 
     if _AR_BAN.match(text):
@@ -298,7 +301,7 @@ async def arabic_trigger_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register(app: Application) -> None:
-    """Attach all moderation handlers (slash commands + Arabic triggers)."""
+    """Attach all moderation handlers to the application."""
     group_filter = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
 
     # English slash commands
@@ -308,7 +311,7 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("mute",   _handle_mute,   filters=group_filter))
     app.add_handler(CommandHandler("unmute", _handle_unmute, filters=group_filter))
 
-    # Arabic text triggers (group messages only)
+    # Arabic text triggers
     app.add_handler(
         MessageHandler(group_filter & _AR_MOD_FILTER, arabic_trigger_handler)
     )
