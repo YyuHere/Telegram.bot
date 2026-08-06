@@ -195,7 +195,7 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = msg.chat.id
     user    = msg.from_user
 
-    await status.edit_text(f"🔍 جاري البحث عن: {query}")
+    status = await msg.reply_text(f"🔍 جاري البحث عن: {query}")
 
     # ── Resolve audio + warm assistant peer cache concurrently ────────────────
     # yt-dlp search and Pyrogram peer-cache warmup are independent — run them

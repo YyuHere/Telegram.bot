@@ -2,21 +2,21 @@
 python-telegram-bot==21.5
 
 # Environment variable loading
-python-dotenv>=1.0.1
+python-dotenv==1.0.1
 
-# Pyrogram compatible with py-tgcalls 0.9.7
+# Pyrogram — compatible with py-tgcalls 2.x
 pyrogram==2.0.106
-tgcrypto
+tgcrypto==1.2.5
 
 # Voice chat streaming — 2.x series (0.9.7 was removed from PyPI)
-# The player already includes API compatibility shims for both 0.9.x and 2.x/3.x.
-py-tgcalls>=2.2.11,<3.0
+# AudioPiped import path: from pytgcalls.types import AudioPiped
+py-tgcalls==2.2.11
 
-# Audio download / stream URL resolution — always use the latest release
-yt-dlp>=2025.1.1
+# Audio download / stream URL resolution
+yt-dlp==2025.1.1
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
-spotipy>=2.23.0
+spotipy==2.24.0
 
 # HTTP client — used for Anghami search API (Stage 3 fallback)
-requests>=2.31.0
+requests==2.31.0

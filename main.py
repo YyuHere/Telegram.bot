@@ -40,7 +40,7 @@ async def _startup(app: Application) -> None:
 
     Startup order matters:
     ──────────────────────
-    py-tgcalls 0.9.x owns the Pyrogram client lifecycle.  ``call_py.start()``
+    py-tgcalls 2.x owns the Pyrogram client lifecycle.  ``call_py.start()``
     starts both the pytgcalls engine *and* the underlying Pyrogram session.
     Calling ``_assistant.start()`` separately beforehand causes a double-start
     error ("Client is already started") that leaves the session in an
@@ -54,6 +54,25 @@ async def _startup(app: Application) -> None:
       3. We verify the session is live with ``_assistant.is_connected`` before
          using it anywhere.
     """
+    # ── Run health check BEFORE starting — surfaces ffmpeg / import issues ────
+    hc = music_player.health_check()
+    if hc["all_ok"]:
+        logger.info(
+            "Health check OK — ffmpeg=%s, pytgcalls=%s, userbot=%s",
+            hc.get("ffmpeg_version", "?"),
+            hc.get("pytgcalls_version", "?"),
+            hc.get("userbot"),
+        )
+    else:
+        logger.error(
+            "Health check FAILED — ffmpeg=%s, pytgcalls=%s, userbot=%s\n"
+            "  ffmpeg_error: %s\n  pytgcalls_error: %s\n  userbot_error: %s",
+            hc["ffmpeg"], hc["pytgcalls"], hc["userbot"],
+            hc.get("ffmpeg_error", "—"),
+            hc.get("pytgcalls_error", "—"),
+            hc.get("userbot_error", "—"),
+        )
+
     # ── Start PyTgCalls (also boots the Pyrogram assistant inside) ────────────
     await music_player.ensure_pytgcalls_started()
 

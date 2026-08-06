@@ -11,6 +11,8 @@ so the bot can manage multiple groups simultaneously.
 
 import asyncio
 import logging
+import shutil
+import subprocess
 from typing import TypedDict
 
 import yt_dlp
@@ -43,16 +45,20 @@ def _resolve_stream_builder():
 
     Detection order (most-specific first to avoid noisy ImportErrors):
 
-      1. AudioPiped / HighQualityAudio  — py-tgcalls 0.9.x (pinned in
-         requirements.txt).  This is the correct API for this project.
+      1. AudioPiped / HighQualityAudio  — py-tgcalls 0.9.x.
+         Import path: pytgcalls.types.input_stream
          Pattern: AudioPiped(url, HighQualityAudio())
 
-      2. MediaStream  — py-tgcalls ≥ 3.x / pytgcalls fork.  Tried second so
-         an accidental upgrade is handled gracefully.
+      2. AudioPiped  — py-tgcalls 2.x (the version pinned in requirements.txt).
+         Import path: pytgcalls.types
+         Pattern: AudioPiped(url)
+
+      3. MediaStream  — py-tgcalls ≥ 3.x / pytgcalls fork.
+         Import path: pytgcalls.types
          Pattern: MediaStream(url)
 
-    If neither import succeeds the engine logs a clear error and returns a
-    no-op lambda; callers guard on call_py being None.
+    If none succeed the engine logs a clear error and returns a no-op lambda;
+    callers guard on call_py being None.
     """
     # ── py-tgcalls 0.9.x  ─────────────────────────────────────────────────────
     try:
@@ -60,6 +66,14 @@ def _resolve_stream_builder():
         from pytgcalls.types.input_stream.quality import HighQualityAudio  # noqa: PLC0415
         logger.info("pytgcalls stream API: AudioPiped / HighQualityAudio (py-tgcalls 0.9.x)")
         return lambda url: AudioPiped(url, HighQualityAudio())
+    except ImportError:
+        pass
+
+    # ── py-tgcalls 2.x  ──────────────────────────────────────────────────────
+    try:
+        from pytgcalls.types import AudioPiped as _AudioPiped2       # noqa: PLC0415
+        logger.info("pytgcalls stream API: AudioPiped (py-tgcalls 2.x)")
+        return lambda url: _AudioPiped2(url)
     except ImportError:
         pass
 
@@ -72,9 +86,9 @@ def _resolve_stream_builder():
         pass
 
     logger.error(
-        "pytgcalls stream API: neither AudioPiped nor MediaStream could be "
-        "imported.  Ensure py-tgcalls==0.9.7 (or compatible) and tgcrypto "
-        "are installed correctly."
+        "pytgcalls stream API: could not import AudioPiped or MediaStream from "
+        "any known path. Installed py-tgcalls version may be incompatible. "
+        "Ensure py-tgcalls>=2.2.11,<3.0 and tgcrypto are installed correctly."
     )
     return lambda url: None
 
@@ -98,7 +112,11 @@ if assistant is not None:
         # in `except` clauses inside py-tgcalls — they are never raised by
         # pyrogram itself, so behaviour is unchanged.
         import pyrogram.errors as _pyr_errors
-        for _missing in ('GroupcallForbidden', 'GroupcallInvalid'):
+        _missing_errors = (
+            'GroupcallForbidden', 'GroupcallInvalid',
+            'GroupcallForbiddenException', 'GroupcallInvalidException',
+        )
+        for _missing in _missing_errors:
             if not hasattr(_pyr_errors, _missing):
                 setattr(_pyr_errors, _missing, type(_missing, (Exception,), {}))
                 logger.debug(
@@ -111,16 +129,36 @@ if assistant is not None:
         _stream_builder = _resolve_stream_builder()
         call_py = PyTgCalls(assistant)
         logger.info("PyTgCalls instance created successfully.")
-    except Exception:
-        # logger.exception() prints the full traceback, not just the message,
-        # so the exact failure reason (import error, version mismatch, bad
-        # session string, missing native library, …) is visible in the logs.
-        logger.exception(
-            "Failed to create PyTgCalls instance. "
-            "Check that py-tgcalls, pyrogram==2.0.106, and tgcrypto are "
-            "installed at compatible versions, and that "
-            "ASSISTANT_SESSION_STRING is valid."
-        )
+    except Exception as _init_exc:
+        _exc_str = str(_init_exc).lower()
+        if "no module named" in _exc_str or "importerror" in _exc_str:
+            logger.error(
+                "PyTgCalls init failed — IMPORT ERROR: %s\n"
+                "Ensure py-tgcalls>=2.2.11,<3.0, pyrogram==2.0.106, and tgcrypto "
+                "are installed. Run: pip install py-tgcalls>=2.2.11,<3.0 "
+                "pyrogram==2.0.106 tgcrypto",
+                _init_exc,
+            )
+        elif "ffmpeg" in _exc_str:
+            logger.error(
+                "PyTgCalls init failed — FFMPEG NOT FOUND: %s\n"
+                "Install ffmpeg on the system (apt install ffmpeg or add it "
+                "to Dockerfile/replit.nix).",
+                _init_exc,
+            )
+        elif "session" in _exc_str or "auth" in _exc_str:
+            logger.error(
+                "PyTgCalls init failed — USERBOT SESSION INVALID: %s\n"
+                "Regenerate ASSISTANT_SESSION_STRING with generate_session.py.",
+                _init_exc,
+            )
+        else:
+            logger.exception(
+                "Failed to create PyTgCalls instance (unexpected error). "
+                "Check that py-tgcalls, pyrogram==2.0.106, and tgcrypto are "
+                "installed at compatible versions, and that "
+                "ASSISTANT_SESSION_STRING is valid."
+            )
         _stream_builder = lambda url: None
 else:
     _stream_builder = lambda url: None
@@ -192,6 +230,79 @@ async def ensure_pytgcalls_started() -> None:
             "unavailable. Check the ASSISTANT_SESSION_STRING secret and "
             "ensure pyrogram, pytgcalls, and tgcrypto are at compatible versions."
         )
+
+
+# ─── Health check ─────────────────────────────────────────────────────────────
+
+def health_check() -> dict:
+    """
+    Verify that every dependency needed for voice chat streaming is available.
+
+    Checks:
+      1. ffmpeg is installed and callable on the system PATH.
+      2. PyTgCalls instance was created (call_py is not None).
+      3. Pyrogram assistant client exists and is connected.
+
+    Returns a dict with boolean flags and human-readable detail strings.
+    Never raises — safe to call at any time, including before the bot starts.
+    """
+    result: dict = {"ffmpeg": False, "pytgcalls": False, "userbot": False}
+
+    # ── 1. ffmpeg ──────────────────────────────────────────────────────────────
+    if shutil.which("ffmpeg") is not None:
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if proc.returncode == 0:
+                result["ffmpeg"] = True
+                result["ffmpeg_version"] = proc.stdout.split("\n")[0]
+            else:
+                result["ffmpeg_error"] = "ffmpeg -version returned non-zero"
+        except Exception as exc:
+            result["ffmpeg_error"] = str(exc)
+    else:
+        result["ffmpeg_error"] = (
+            "ffmpeg not found on PATH. Install it via 'apt install ffmpeg' "
+            "or add it to Dockerfile / replit.nix."
+        )
+
+    # ── 2. PyTgCalls ───────────────────────────────────────────────────────────
+    if call_py is not None:
+        result["pytgcalls"] = True
+        try:
+            import pytgcalls as _ptg
+            result["pytgcalls_version"] = getattr(_ptg, "__version__", "unknown")
+        except Exception:
+            pass
+    else:
+        result["pytgcalls_error"] = (
+            "PyTgCalls instance is None — initialization failed. "
+            "Check server logs for the exact import / version error."
+        )
+
+    # ── 3. Userbot ──────────────────────────────────────────────────────────────
+    if assistant is not None:
+        try:
+            result["userbot"] = bool(assistant.is_connected)
+            if not assistant.is_connected:
+                result["userbot_error"] = (
+                    "Pyrogram assistant exists but is not connected. "
+                    "The session may be invalid or .start() has not been called."
+                )
+        except Exception as exc:
+            result["userbot_error"] = str(exc)
+    else:
+        result["userbot_error"] = (
+            "Pyrogram assistant is None — ASSISTANT_SESSION_STRING, API_ID, "
+            "or API_HASH is missing."
+        )
+
+    result["all_ok"] = all(
+        result.get(k, False) for k in ("ffmpeg", "pytgcalls", "userbot")
+    )
+    return result
 
 
 # ─── Source constants ─────────────────────────────────────────────────────────
