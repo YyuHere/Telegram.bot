@@ -454,12 +454,21 @@ def get_audio_info(query: str) -> TrackInfo:
 
 # Error substrings that mean there is no active Telegram Voice Chat in the
 # chat (as opposed to auth / network failures).
+# py-tgcalls 0.9.x surfaces these when JoinGroupCall is sent to a chat that
+# has no running call.  Telegram may return GROUPCALL_FORBIDDEN (supergroups
+# where call was never started), GROUPCALL_INVALID (call ended / never existed),
+# or a generic "no active" message depending on version and chat type.
 _NO_CALL_KEYWORDS = (
     "no active",
+    "not active",
     "groupcall_forbidden",
     "groupcall_invalid",
+    "groupcall_notfound",
     "group call",
     "call not found",
+    "call_id invalid",
+    "video_chat_id",        # some pyrogram versions surface this
+    "voice_chat",           # "voice_chat_empty" / "voice_chat_not_started"
 )
 
 # Error substrings that mean the assistant is not a member of the chat at all.
@@ -676,13 +685,20 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
 
 async def _create_voice_chat(chat_id: int) -> None:
     """
-    Start a new Telegram Voice Chat in *chat_id* via the Pyrogram assistant's
-    raw MTProto API (phone.CreateGroupCall).
+    Start a new Telegram Voice Chat in *chat_id* via phone.CreateGroupCall.
 
-    py-tgcalls cannot join a call that does not yet exist, so the assistant
-    must create it first.  GROUPCALL_ALREADY_STARTED is silently ignored.
-    The assistant is guaranteed to be a chat member before this is called
-    (enforced by _join_group_call_with_autocreate).
+    Called only when join_group_call has already failed because no call is
+    active — never proactively.  Requires the userbot to have the
+    "Manage Voice Chats" (manage_call) admin permission.
+
+    Error handling
+    --------------
+    GROUPCALL_ALREADY_STARTED  — silently ignored (race: call started between
+                                 join attempt and this create attempt).
+    CHAT_ADMIN_REQUIRED        — raised as a clear RuntimeError with an Arabic
+                                 message explaining exactly which admin permission
+                                 is needed and how to grant it.
+    Anything else              — re-raised unchanged for the caller to surface.
     """
     if assistant is None:
         raise RuntimeError(
@@ -702,14 +718,27 @@ async def _create_voice_chat(chat_id: int) -> None:
             )
         )
         logger.info(
-            "Voice chat created in chat %s — waiting 1.5 s for Telegram to activate it.",
+            "Voice chat created in chat %s — waiting 2 s for Telegram to activate it.",
             chat_id,
         )
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
     except Exception as exc:
         err = str(exc).lower()
         if "already_started" in err or "already started" in err:
+            # Another client started the call between our join attempt and now.
             logger.debug("_create_voice_chat: call already active in chat %s", chat_id)
+        elif "chat_admin_required" in err or "admin_required" in err:
+            # The userbot is a plain member, not an admin with manage_call right.
+            # Surface an actionable Arabic error instead of a raw Telegram error.
+            raise RuntimeError(
+                "⚠️ لا يمكن بدء المكالمة الصوتية تلقائيًا — "
+                "@HelpQaed لا يملك صلاحية «إدارة المكالمات الصوتية».\n\n"
+                "الحلول المتاحة (اختر أحدها):\n"
+                "١. افتح إعدادات المجموعة ← المسؤولون ← @HelpQaed "
+                "← فعّل «إدارة المكالمات الصوتية» فقط.\n"
+                "٢. أو ابدأ المكالمة الصوتية يدويًا من أي تطبيق تيليغرام، "
+                "ثم أعد إرسال أمر /play."
+            ) from exc
         else:
             logger.warning("_create_voice_chat failed for chat %s: %s", chat_id, exc)
             raise
@@ -717,43 +746,46 @@ async def _create_voice_chat(chat_id: int) -> None:
 
 async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     """
-    Robustly join the voice chat for *chat_id*, with full auto-join and
-    auto-create behaviour:
+    Robustly join the voice chat for *chat_id*, auto-creating one only when
+    needed.  This is the pattern used by all standard Telegram music bots.
 
     Step 1 — Membership + peer cache
         ``_ensure_assistant_in_chat`` auto-joins the group via @username or
-        invite link when the userbot isn't a member yet.  Raises RuntimeError
-        if every strategy fails (caller surfaces the Arabic error).
+        invite link when the userbot is not a member.  Raises RuntimeError if
+        every strategy fails.
 
-    Step 2 — Proactive voice-chat creation
-        Always call ``_create_voice_chat`` before joining.  If a call is
-        already active, ``GROUPCALL_ALREADY_STARTED`` is silently swallowed
-        inside that helper — no harm done.  This removes the need to detect
-        "no active call" errors reactively and makes the startup path explicit.
+    Step 2 — join_group_call (reactive, not proactive)
+        Try to join the call directly.  If a call is already running this
+        succeeds immediately — no admin rights needed.  Creation is attempted
+        *only* when join fails because no call is active:
 
-    Step 3 — join_group_call with a single retry
-        * "already in call" / "already joined" → the assistant is already
-          streaming; switch to ``change_stream`` instead of joining again.
-        * Peer / membership keyword             → re-ensure membership once,
-          then retry ``join_group_call``.
-        * Anything else                         → re-raise unchanged.
+        • "already in call" / "already joined"
+              The userbot is already streaming — switch via change_stream().
+        • Peer / membership keyword (attempt 0)
+              Re-ensure membership, retry once.
+        • No-active-call keyword (attempt 0)
+              Call _create_voice_chat() [requires "Manage Voice Chats" admin],
+              then retry join_group_call once.
+        • Anything else / second-attempt failure
+              Re-raise unchanged.
+
+    Why not proactive creation?
+        phone.CreateGroupCall requires the "Manage Voice Chats" (manage_call)
+        admin permission.  Calling it unconditionally — even when a call is
+        already running — produces CHAT_ADMIN_REQUIRED for plain members.
+        The reactive approach avoids touching the API entirely when a call is
+        already active, matching how music bots like YukkiMusicBot operate.
     """
     # ── Step 1: guarantee membership + peer cache ─────────────────────────────
     ready = await _ensure_assistant_in_chat(chat_id)
     if not ready:
         raise RuntimeError(
             "⚠️ تعذّر على الحساب المساعد @HelpQaed الانضمام إلى المجموعة.\n"
-            "• أضف @HelpQaed إلى المجموعة يدويًا، أو تأكد أن البوت مسؤول "
-            "وله صلاحية دعوة الأعضاء.\n"
+            "• أضف @HelpQaed إلى المجموعة يدويًا.\n"
             "• ثم أعد المحاولة بأمر /play."
         )
 
-    # ── Step 2: ensure a voice chat exists (proactive, idempotent) ───────────
-    # _create_voice_chat silently ignores GROUPCALL_ALREADY_STARTED, so it is
-    # safe to call even when a call is already running.
-    await _create_voice_chat(chat_id)
-
-    # ── Step 3: join the call (with one membership-error retry) ───────────────
+    # ── Step 2: join the call reactively ─────────────────────────────────────
     for attempt in range(2):
         try:
             await call_py.join_group_call(chat_id, stream)
@@ -764,24 +796,36 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
         except Exception as exc:
             err = str(exc).lower()
 
-            # The userbot is already streaming in this call — swap the stream.
+            # ── Already streaming in this call — swap the stream ──────────────
             if "already" in err or "joined" in err:
                 logger.info(
-                    "Already in voice call for chat %s — switching stream via change_stream",
+                    "Already in voice call for chat %s — switching stream",
                     chat_id,
                 )
                 await call_py.change_stream(chat_id, stream)
                 return
 
-            # Peer / membership error on first attempt — re-ensure and retry.
-            if attempt == 0 and any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
-                logger.info(
-                    "join_group_call(%s) peer/membership error (%s) "
-                    "— re-ensuring membership and retrying",
-                    chat_id, exc,
-                )
-                await _ensure_assistant_in_chat(chat_id)
-                continue  # second iteration of the loop
+            if attempt == 0:
+                # ── No active voice chat — create one, then retry ─────────────
+                # _create_voice_chat raises a clear RuntimeError when
+                # CHAT_ADMIN_REQUIRED is returned (userbot lacks manage_call).
+                if any(kw in err for kw in _NO_CALL_KEYWORDS):
+                    logger.info(
+                        "No active voice chat in chat %s (%s) — creating one",
+                        chat_id, exc,
+                    )
+                    await _create_voice_chat(chat_id)
+                    continue  # retry join_group_call
+
+                # ── Peer / membership issue — re-ensure once and retry ─────────
+                if any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
+                    logger.info(
+                        "join_group_call(%s) peer/membership error (%s) "
+                        "— re-ensuring and retrying",
+                        chat_id, exc,
+                    )
+                    await _ensure_assistant_in_chat(chat_id)
+                    continue  # retry join_group_call
 
             # Unrelated error, or second attempt also failed — surface it.
             raise
