@@ -86,6 +86,18 @@ def _music_keyboard(chat_id: int, bot_username: str) -> InlineKeyboardMarkup:
 # Structure: { (chat_id, user_id): TrackInfo }
 _pending_enqueue: dict[tuple[int, int], "player.TrackInfo"] = {}
 
+# Bot username cache — fetched once on first play, reused thereafter.
+_bot_username_cache: str = ""
+
+
+async def _get_bot_username(bot) -> str:
+    """Return the bot's username, fetching from the API only on the first call."""
+    global _bot_username_cache
+    if not _bot_username_cache:
+        me = await bot.get_me()
+        _bot_username_cache = me.username or ""
+    return _bot_username_cache
+
 
 # ─── Caption builder ──────────────────────────────────────────────────────────
 
@@ -180,18 +192,23 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    status = await msg.reply_text("🔍 جاري البحث…")
-
-    # ── Resolve audio (blocking — run in thread) ──────────────────────────────
-    try:
-        track = await asyncio.to_thread(player.get_audio_info, query)
-    except Exception as exc:
-        logger.warning("yt-dlp failed for %r: %s", query, exc)
-        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
-        return
-
     chat_id = msg.chat.id
     user    = msg.from_user
+
+    status = await msg.reply_text("🔍 جاري البحث…")
+
+    # ── Resolve audio + warm assistant peer cache concurrently ────────────────
+    # yt-dlp search and Pyrogram peer-cache warmup are independent — run them
+    # in parallel so the assistant is ready by the time the track URL arrives.
+    try:
+        track, _ = await asyncio.gather(
+            asyncio.to_thread(player.get_audio_info, query),
+            player.warm_assistant(chat_id),
+        )
+    except Exception as exc:
+        logger.warning("Search failed for %r: %s", query, exc)
+        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
+        return
 
     # ── Play immediately (replace if already streaming) ───────────────────────
     try:
@@ -203,8 +220,7 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await status.delete()
 
-    bot_me       = await context.bot.get_me()
-    bot_username = bot_me.username or ""
+    bot_username = await _get_bot_username(context.bot)
     await _send_now_playing(msg, track, chat_id, user, bot_username)
 
 
@@ -273,8 +289,7 @@ async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     else:
         # Nothing was playing — started immediately
-        bot_me       = await context.bot.get_me()
-        bot_username = bot_me.username or ""
+        bot_username = await _get_bot_username(context.bot)
         await _send_now_playing(msg, track, chat_id, user, bot_username)
 
 

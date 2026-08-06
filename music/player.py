@@ -636,7 +636,7 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
                     "@%s joined chat %s via %r",
                     _config.ASSISTANT_USERNAME, chat_id, identifier,
                 )
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(0.5)
                 try:
                     await assistant.resolve_peer(chat_id)
                     return True          # joined + cached immediately
@@ -662,13 +662,13 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
 
     # ── 4. Cache-warm poll ────────────────────────────────────────────────────
     # Pyrogram receives the membership update asynchronously; poll until
-    # resolve_peer() succeeds or we time out (10 s).
-    for attempt in range(10):
-        await asyncio.sleep(1.0)
+    # resolve_peer() succeeds or we time out (4 s at 0.5 s intervals).
+    for attempt in range(8):
+        await asyncio.sleep(0.5)
         try:
             await assistant.resolve_peer(chat_id)
             logger.info(
-                "Peer %s resolved for @%s (attempt %d/10)",
+                "Peer %s resolved for @%s (attempt %d/8)",
                 chat_id, _config.ASSISTANT_USERNAME, attempt + 1,
             )
             return True
@@ -676,7 +676,7 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
             pass
 
     logger.warning(
-        "_ensure_assistant_in_chat(%s): @%s peer still unresolvable after 10 s — "
+        "_ensure_assistant_in_chat(%s): @%s peer still unresolvable after 4 s — "
         "the userbot may have joined but Pyrogram hasn't processed the update yet.",
         chat_id, _config.ASSISTANT_USERNAME,
     )
@@ -721,7 +721,7 @@ async def _create_voice_chat(chat_id: int) -> None:
             "Voice chat created in chat %s — waiting 2 s for Telegram to activate it.",
             chat_id,
         )
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
     except Exception as exc:
         err = str(exc).lower()
         if "already_started" in err or "already started" in err:
@@ -832,6 +832,26 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
+
+async def warm_assistant(chat_id: int) -> None:
+    """
+    Pre-warm the Pyrogram peer cache for *chat_id* in the background.
+
+    Called concurrently with yt-dlp audio resolution so that by the time
+    the track URL is ready the assistant is already a member and its peer
+    is resolved — eliminating the membership/cache-warm delay from the
+    critical play path.
+
+    This function is intentionally non-fatal: any error is logged at DEBUG
+    level and play() will retry _ensure_assistant_in_chat() itself.
+    """
+    if assistant is None or call_py is None:
+        return
+    try:
+        await _ensure_assistant_in_chat(chat_id)
+    except Exception as exc:
+        logger.debug("warm_assistant(%s) background error: %s", chat_id, exc)
+
 
 async def play(chat_id: int, track: TrackInfo) -> None:
     """
