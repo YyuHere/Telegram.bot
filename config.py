@@ -25,6 +25,11 @@ ASSISTANT_SESSION_STRING: str = os.getenv("ASSISTANT_SESSION_STRING", "")
 # True only when all three Pyrogram credentials are present
 ASSISTANT_ENABLED: bool = bool(API_ID and API_HASH and ASSISTANT_SESSION_STRING)
 
+# ── Spotify Web API credentials (optional — enables Stage 2 fallback) ─────────
+# Create a free app at https://developer.spotify.com/dashboard and set these.
+SPOTIFY_CLIENT_ID: str     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
 # Bot admin user ID — the only user allowed to add replies via private DM.
 # Set BOT_ADMIN_ID in Replit Secrets (integer Telegram user ID).
 _admin_id_raw = os.environ.get("BOT_ADMIN_ID", "")

@@ -195,7 +195,7 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = msg.chat.id
     user    = msg.from_user
 
-    status = await msg.reply_text("🔍 جاري البحث…")
+    await status.edit_text(f"🔍 جاري البحث عن: {query}")
 
     # ── Resolve audio + warm assistant peer cache concurrently ────────────────
     # yt-dlp search and Pyrogram peer-cache warmup are independent — run them
@@ -207,8 +207,19 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except Exception as exc:
         logger.warning("Search failed for %r: %s", query, exc)
-        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
+        await status.edit_text(f"❌ لم يتم العثور على الأغنية. جرب اسمًا آخر.")
         return
+
+    # ── Show source-specific progress message ─────────────────────────────────
+    _source_msgs = {
+        player.SOURCE_YOUTUBE: "🎵 جاري التشغيل من YouTube...",
+        player.SOURCE_SPOTIFY: "🎧 تم العثور عبر Spotify، جاري التشغيل...",
+        player.SOURCE_ANGHAMI: "🎶 جاري التشغيل من Anghami...",
+    }
+    src_msg = _source_msgs.get(track.get("source", ""), "🎵 جاري التشغيل...")
+    await status.edit_text(
+        f"{src_msg}\n⏱️ مدة الأغنية: {track['duration']}"
+    )
 
     # ── Play immediately (replace if already streaming) ───────────────────────
     try:

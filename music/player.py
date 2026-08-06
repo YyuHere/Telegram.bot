@@ -133,6 +133,7 @@ class TrackInfo(TypedDict):
     title: str
     duration: str       # "m:ss"
     thumbnail: str      # URL
+    source: str         # "youtube" | "spotify" | "anghami"
 
 
 # ─── Per-chat state ───────────────────────────────────────────────────────────
@@ -193,43 +194,17 @@ async def ensure_pytgcalls_started() -> None:
         )
 
 
-# ─── yt-dlp helpers ───────────────────────────────────────────────────────────
+# ─── Source constants ─────────────────────────────────────────────────────────
 
-def _ydl_opts() -> dict:
-    """
-    Build yt-dlp options for SoundCloud search and generic URL extraction.
+SOURCE_YOUTUBE = "youtube"
+SOURCE_SPOTIFY = "spotify"   # Spotify metadata → YouTube stream
+SOURCE_ANGHAMI = "anghami"  # Anghami metadata → YouTube stream
 
-    YouTube is intentionally excluded — SoundCloud has no bot-detection gate
-    and carries a strong Arabic/regional catalogue that covers the vast majority
-    of user requests.  Generic ``http(s)://`` URLs (direct audio files, other
-    yt-dlp-supported platforms) are also handled.
-    """
-    import os
 
-    opts: dict = {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        # Generic browser User-Agent — works for SoundCloud and most other
-        # yt-dlp extractors without requiring platform-specific client IDs.
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        },
-    }
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-    # Optional cookie file for any platform that requires authentication.
-    cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookie_file and os.path.isfile(cookie_file):
-        opts["cookiefile"] = cookie_file
-        logger.debug("yt-dlp: using cookie file %s", cookie_file)
-
-    return opts
-
+import re as _re
+import os as _os
 
 def _fmt_duration(secs: int) -> str:
     """Convert seconds to m:ss string."""
@@ -240,14 +215,11 @@ def _fmt_duration(secs: int) -> str:
     return f"{m}:{s:02d}"
 
 
-import re as _re
-
-# ─── Arabic text helpers ──────────────────────────────────────────────────────
-
-# Unicode ranges for Arabic diacritical marks (tashkeel / harakat).
-# These are present in Quranic/formal text but absent from SoundCloud titles,
-# so stripping them dramatically improves search hit-rates.
-_TASHKEEL_RE = _re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]")
+# Arabic diacritical marks (tashkeel / harakat) — strip before searching so
+# "أُغنِيَة" matches the same result as "اغنية".
+_TASHKEEL_RE = _re.compile(
+    r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]"
+)
 
 
 def _strip_tashkeel(text: str) -> str:
@@ -255,36 +227,23 @@ def _strip_tashkeel(text: str) -> str:
     return _TASHKEEL_RE.sub("", text).strip()
 
 
-# Hostnames that unambiguously identify a platform URL even without a scheme.
-# YouTube is intentionally absent — it is no longer supported.
 _PLATFORM_HOSTS = (
-    "soundcloud.com", "www.soundcloud.com", "on.soundcloud.com",
+    "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
+    "music.youtube.com",
+    "soundcloud.com", "www.soundcloud.com",
     "spotify.com", "open.spotify.com",
-    "mixcloud.com", "www.mixcloud.com",
-    "bandcamp.com",
-    "deezer.com", "www.deezer.com",
+    "anghami.com", "play.anghami.com",
 )
+
+_DIRECT_AUDIO_EXTS = (".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac", ".webm")
 
 
 def _is_url(text: str) -> bool:
-    """
-    Return True if *text* is a URL rather than a search query.
-
-    Accepts:
-      • Any string starting with ``http://``, ``https://``, or ``www.``
-      • Bare platform hostnames (soundcloud.com/…, etc.)
-        so users don't have to type the scheme.
-    """
+    """Return True if *text* is a URL rather than a plain search query."""
     if text.startswith(("http://", "https://", "www.")):
         return True
-    # Check for bare platform hostnames (no scheme prefix)
     lower = text.lower()
     return any(lower.startswith(host + "/") or lower == host for host in _PLATFORM_HOSTS)
-
-
-# Common audio-file extensions whose URLs can be piped directly into pytgcalls
-# without going through yt-dlp's extraction step.
-_DIRECT_AUDIO_EXTS = (".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac", ".webm")
 
 
 def _is_direct_audio_url(url: str) -> bool:
@@ -293,67 +252,45 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
-# yt-dlp error substrings that indicate an extraction / access failure.
-_EXTRACTION_ERROR_PHRASES = (
-    "sign in to confirm",
-    "confirm you're not a bot",
-    "confirm you are not a bot",
-    "bot detection",
-    "this video is not available",
-    "video unavailable",
-    "private track",
-    "content not available",
-    "geo restriction",
-)
-
-
-def _search_variants(query: str) -> list[tuple[str, str]]:
+def _ydl_opts(extra: dict | None = None) -> dict:
     """
-    Return a prioritized list of ``(yt-dlp-prefix, query_string)`` pairs that
-    ``get_audio_info`` will try in order until one succeeds.
-
-    YouTube is excluded entirely.  SoundCloud is the primary search platform:
-    it has no bot-detection gate, is fully supported by yt-dlp, and carries a
-    large Arabic/regional catalogue.
-
-    Pipeline:
-      1. SoundCloud — original query, 5 candidates
-      2. SoundCloud — tashkeel-stripped query (only added when it differs)
-      3. SoundCloud — first 4 words of original (only for long queries)
-
-    Duplicates are suppressed so the same string is never tried twice.
+    Build yt-dlp options with realistic browser headers and the YouTube
+    web player client to reduce bot-detection blocking.
     """
-    seen: set[tuple[str, str]] = set()
-    variants: list[tuple[str, str]] = []
+    opts: dict = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # Use the web player client — avoids signature-cipher blocks that the
+        # android/iOS clients increasingly hit on certain regions.
+        "extractor_args": {
+            "youtube": {"player_client": ["web"]},
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        },
+    }
+    cookie_file = _os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_file and _os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
+    if extra:
+        opts.update(extra)
+    return opts
 
-    def _add(prefix: str, q: str) -> None:
-        key = (prefix, q.strip())
-        if key not in seen:
-            seen.add(key)
-            variants.append(key)
 
-    normalized = _strip_tashkeel(query)
-    words = query.split()
-    short = " ".join(words[:4]) if len(words) > 4 else ""
-
-    _add("scsearch5", query)
-
-    if normalized != query:
-        _add("scsearch5", normalized)
-
-    if short and short != query:
-        _add("scsearch5", short)
-
-    return variants
-
-
-def _extract_first_valid(info: dict, query: str) -> "TrackInfo | None":
+def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
     """
-    Given a yt-dlp result dict, return the first entry that has a usable URL.
-    Returns None so the caller can transparently try the next fallback stage.
+    Pull the first usable entry from a yt-dlp result dict and return it as
+    a TrackInfo.  Returns None when no playable URL is found.
     """
     if "entries" in info:
-        entries = [e for e in (info["entries"] or []) if e]
+        entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
             return None
         info = entries[0]
@@ -367,86 +304,243 @@ def _extract_first_valid(info: dict, query: str) -> "TrackInfo | None":
         title=info.get("title", query),
         duration=_fmt_duration(info.get("duration") or 0),
         thumbnail=info.get("thumbnail", ""),
+        source=source,
     )
 
 
+# ─── Stage 1: YouTube ─────────────────────────────────────────────────────────
+
+def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
+    """
+    Search YouTube for *query* via ``ytsearch5`` and return the best result.
+
+    Tries variants in order to maximise Arabic hit-rate:
+      1. Original query
+      2. Tashkeel-stripped query (when different)
+      3. First 4 words (for long titles)
+
+    Returns None when all variants fail so the caller can fall through to the
+    next source.  Never raises.
+    """
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(q: str) -> None:
+        k = q.strip()
+        if k and k not in seen:
+            seen.add(k)
+            variants.append(k)
+
+    _add(query)
+    stripped = _strip_tashkeel(query)
+    if stripped != query:
+        _add(stripped)
+    words = query.split()
+    if len(words) > 4:
+        _add(" ".join(words[:4]))
+
+    opts = _ydl_opts()
+    for q in variants:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch5:{q}", download=False)
+            track = _extract_track(info, q, source_tag)
+            if track:
+                logger.info("YouTube search: found %r for query %r", track["title"], q)
+                return track
+        except Exception as exc:
+            logger.warning("YouTube search failed for %r: %s", q, exc)
+
+    return None
+
+
+def get_best_audio_url(url_or_id: str) -> "TrackInfo | None":
+    """
+    Extract the best audio stream URL from a YouTube video URL or ID.
+
+    Used for direct YouTube links and for Spotify/Anghami-guided lookups
+    where we already know the exact video.  Never raises.
+    """
+    if not url_or_id.startswith("http"):
+        url_or_id = f"https://www.youtube.com/watch?v={url_or_id}"
+
+    opts = _ydl_opts()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url_or_id, download=False)
+        return _extract_track(info, url_or_id, SOURCE_YOUTUBE)
+    except Exception as exc:
+        logger.warning("get_best_audio_url(%r) failed: %s", url_or_id, exc)
+        return None
+
+
+# ─── Stage 2: Spotify metadata ────────────────────────────────────────────────
+
+def search_spotify(query: str) -> "str | None":
+    """
+    Search Spotify for *query* and return ``"Artist - Track Name"``.
+
+    Requires ``SPOTIFY_CLIENT_ID`` and ``SPOTIFY_CLIENT_SECRET`` in config.
+    Uses the Client Credentials flow — no user login required.
+    Returns None when credentials are absent, the API is unreachable, or no
+    results are found.  Never raises.
+    """
+    try:
+        import config as _cfg
+        if not (_cfg.SPOTIFY_CLIENT_ID and _cfg.SPOTIFY_CLIENT_SECRET):
+            return None
+
+        import spotipy
+        from spotipy.oauth2 import SpotifyClientCredentials
+
+        sp = spotipy.Spotify(
+            auth_manager=SpotifyClientCredentials(
+                client_id=_cfg.SPOTIFY_CLIENT_ID,
+                client_secret=_cfg.SPOTIFY_CLIENT_SECRET,
+            )
+        )
+        results = sp.search(q=query, limit=5, type="track")
+        items = (results.get("tracks") or {}).get("items") or []
+        if not items:
+            return None
+
+        track = items[0]
+        artist = track["artists"][0]["name"] if track.get("artists") else ""
+        title  = track.get("name", "")
+        if title:
+            refined = f"{artist} - {title}" if artist else title
+            logger.info("Spotify metadata: %r for query %r", refined, query)
+            return refined
+
+    except Exception as exc:
+        logger.warning("Spotify search failed for %r: %s", query, exc)
+
+    return None
+
+
+# ─── Stage 3: Anghami metadata ────────────────────────────────────────────────
+
+def search_anghami(query: str) -> "str | None":
+    """
+    Search Anghami's public REST API for *query* and return
+    ``"Artist - Track Name"`` to guide a refined YouTube search.
+
+    Anghami is particularly strong for Arabic songs and mahraganat that
+    SoundCloud / Spotify may not carry.  Returns None on any failure so the
+    caller can skip gracefully.  Never raises.
+    """
+    try:
+        import requests
+
+        resp = requests.get(
+            "https://api.anghami.com/rest/v1/search.json",
+            params={
+                "query": query,
+                "limit": 5,
+                "searchsections[]": 0,   # songs section only
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; TelegramMusicBot/1.0)",
+                "Accept": "application/json",
+                "Accept-Language": "ar,en;q=0.8",
+            },
+            timeout=8,
+        )
+        if not resp.ok:
+            logger.debug("Anghami API returned HTTP %s for %r", resp.status_code, query)
+            return None
+
+        data = resp.json()
+        # Response shape: {"sections": [{"data": [{"title": ..., "artist": ...}]}]}
+        for section in (data.get("sections") or []):
+            for item in (section.get("data") or []):
+                title  = item.get("title") or item.get("name") or ""
+                artist = item.get("artist") or item.get("artistname") or ""
+                if title:
+                    refined = f"{artist} - {title}" if artist else title
+                    logger.info("Anghami metadata: %r for query %r", refined, query)
+                    return refined
+
+    except Exception as exc:
+        logger.warning("Anghami search failed for %r: %s", query, exc)
+
+    return None
+
+
+# ─── Main resolution function ─────────────────────────────────────────────────
+
 def get_audio_info(query: str) -> TrackInfo:
     """
-    Resolve *query* (song name or direct URL) via yt-dlp.
+    Resolve *query* (song name or direct URL) to a playable audio stream.
 
-    Text queries are searched on SoundCloud (no bot-detection, strong Arabic
-    catalogue).  YouTube is intentionally excluded.
+    Fallback chain
+    ──────────────
+    0. Direct URL      — YouTube/audio links are extracted immediately via yt-dlp.
+    1. YouTube search  — ``ytsearch5`` with Arabic tashkeel support.
+    2. Spotify         — metadata lookup → refined YouTube search.
+    3. Anghami         — metadata lookup → refined YouTube search.
+                         (Strong for Arabic songs / mahraganat.)
 
-    Direct URLs (http/https/www or bare platform hostnames) bypass search:
-      • Raw audio files (.mp3, .opus, etc.) are piped directly to pytgcalls.
-      • All other URLs go through yt-dlp to obtain a real CDN streaming URL.
-
-    For text queries the function walks a staged fallback pipeline
-    (see ``_search_variants``) that handles:
-      • Arabic diacritics (tashkeel) — stripped before retrying.
-      • Long multi-word titles — retried with the first 4 words.
-
-    Returns a TrackInfo dict: url, title, duration (m:ss), thumbnail URL.
-    Raises RuntimeError with an Arabic-language message if all stages fail.
+    Raises RuntimeError with an Arabic message when every stage fails.
     """
-    opts = _ydl_opts()
-
-    # ── Direct URL ────────────────────────────────────────────────────────────
+    # ── Stage 0: direct URL ───────────────────────────────────────────────────
     if _is_url(query):
-        # Normalise bare hostnames → add https:// so yt-dlp can handle them.
         url = query if query.startswith(("http://", "https://")) else f"https://{query}"
 
-        # Raw audio file (.mp3 / .opus / etc.) — skip yt-dlp entirely and pipe
-        # the URL directly to pytgcalls/ffmpeg which handles them natively.
+        # Raw audio file (.mp3 / .opus / etc.) — pipe directly, skip yt-dlp.
         if _is_direct_audio_url(url):
             filename = url.split("/")[-1].split("?")[0] or url
-            logger.info("yt-dlp: direct audio file URL — skipping extraction: %r", filename)
-            return TrackInfo(url=url, title=filename, duration="0:00", thumbnail="")
+            logger.info("Direct audio file — skipping extraction: %r", filename)
+            return TrackInfo(
+                url=url, title=filename, duration="0:00",
+                thumbnail="", source=SOURCE_YOUTUBE,
+            )
 
-        # Platform URL (YouTube, SoundCloud, etc.) — must go through yt-dlp to
-        # obtain a real CDN streaming URL.  Passing the page URL directly to
-        # ffmpeg/pytgcalls causes [Errno 2] No such file or directory because
-        # ffmpeg cannot open an HTML page as audio.
+        # Determine source tag from the URL before extracting.
+        if "anghami.com" in url:
+            tag = SOURCE_ANGHAMI
+        elif "spotify.com" in url:
+            tag = SOURCE_SPOTIFY
+        else:
+            tag = SOURCE_YOUTUBE
+
+        opts = _ydl_opts()
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            track = _extract_first_valid(info, url)
+            track = _extract_track(info, url, tag)
             if track:
                 return track
-            raise RuntimeError("لم يُعثر على رابط تدفق صالح في هذا الرابط.")
-        except RuntimeError:
-            raise
         except Exception as exc:
-            err_lower = str(exc).lower()
-            if any(p in err_lower for p in _EXTRACTION_ERROR_PHRASES):
-                raise RuntimeError(
-                    "❌ تعذّر الوصول إلى هذا الرابط (محتوى خاص أو مقيّد).\n"
-                    "جرّب رابط SoundCloud مباشرًا بدلاً من ذلك."
-                ) from exc
-            raise RuntimeError(
-                f"❌ فشل استخراج الصوت من الرابط:\n{exc}"
-            ) from exc
+            pass
 
-    # ── Staged text search (SoundCloud only) ──────────────────────────────────
-    for prefix, variant in _search_variants(query):
-        search_str = f"{prefix}:{variant}"
-        logger.debug("yt-dlp: trying %r", search_str)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(search_str, download=False)
-            track = _extract_first_valid(info, query)
-            if track:
-                logger.info(
-                    "yt-dlp: found %r via %r (variant=%r)",
-                    track["title"], prefix, variant,
-                )
-                return track
-        except Exception as exc:
-            logger.warning("yt-dlp: %r failed: %s", search_str, exc)
+        raise RuntimeError(
+            "❌ تعذّر استخراج الصوت من هذا الرابط.\n"
+            "تأكد من صحة الرابط أو أرسل رابط يوتيوب مباشرًا."
+        )
+
+    # ── Stage 1: YouTube direct search ───────────────────────────────────────
+    track = search_youtube(query, SOURCE_YOUTUBE)
+    if track:
+        return track
+
+    # ── Stage 2: Spotify metadata → YouTube search ────────────────────────────
+    refined_spotify = search_spotify(query)
+    if refined_spotify:
+        track = search_youtube(refined_spotify, SOURCE_SPOTIFY)
+        if track:
+            return track
+
+    # ── Stage 3: Anghami metadata → YouTube search ────────────────────────────
+    refined_anghami = search_anghami(query)
+    if refined_anghami:
+        track = search_youtube(refined_anghami, SOURCE_ANGHAMI)
+        if track:
+            return track
 
     raise RuntimeError(
-        f"❌ لم يتم العثور على نتائج في SoundCloud لـ: {query!r}\n"
-        "جرّب اسمًا آخر للأغنية، أو أرسل رابط SoundCloud مباشرًا."
+        "❌ لم يتم العثور على الأغنية في أي مصدر.\n"
+        "جرب اسمًا آخر أو أرسل رابط يوتيوب مباشرًا."
     )
 
 

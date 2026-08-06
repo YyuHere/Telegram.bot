@@ -8,8 +8,15 @@ python-dotenv>=1.0.1
 pyrogram==2.0.106
 tgcrypto
 
-# Voice chat streaming (Available version in PyPI list)
-py-tgcalls==0.9.7
+# Voice chat streaming — 2.x series (0.9.7 was removed from PyPI)
+# The player already includes API compatibility shims for both 0.9.x and 2.x/3.x.
+py-tgcalls>=2.2.11,<3.0
 
 # Audio download / stream URL resolution — always use the latest release
 yt-dlp>=2025.1.1
+
+# Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
+spotipy>=2.23.0
+
+# HTTP client — used for Anghami search API (Stage 3 fallback)
+requests>=2.31.0
