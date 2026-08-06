@@ -15,6 +15,7 @@ Inline undo buttons:
 Callback buttons only work for group admins.
 """
 
+import asyncio
 import re
 import logging
 
@@ -116,13 +117,15 @@ _AR_KICK   = re.compile(r"^طرد\b")
 _AR_MUTE   = re.compile(r"^كتم\b")
 _AR_UNMUTE = re.compile(r"^(الغاء\s+الكتم|الغاء\s+كتم)\b")
 _AR_SYNC   = re.compile(r"^تحديث\s+الأعضاء\b")
+_AR_CLEAR  = re.compile(r"^مسح\b")
 
 _AR_MOD_FILTER = filters.Regex(
     re.compile(
         r"^(بان|حظر|الغاء\s+الحظر|الغاء\s+بان|طرد|كتم|الغاء\s+الكتم|الغاء\s+كتم)\b"
     )
 )
-_AR_SYNC_FILTER = filters.Regex(_AR_SYNC)
+_AR_SYNC_FILTER  = filters.Regex(_AR_SYNC)
+_AR_CLEAR_FILTER = filters.Regex(_AR_CLEAR)
 
 ADMIN_STATUSES = {ChatMember.ADMINISTRATOR, ChatMember.OWNER}
 
@@ -627,6 +630,91 @@ async def _handle_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await status_msg.edit_text(result, parse_mode="Markdown")
 
+# ── Purge / clear ─────────────────────────────────────────────────────────────
+
+async def _handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /clear [n]  |  مسح [n]
+
+    Delete the last *n* messages in the chat (default 100, max 100).
+    The command message itself counts toward the total so no orphan is left.
+
+    Telegram constraints
+    --------------------
+    • bot.delete_messages() (Bot API 7.0 / PTB v21) accepts up to 100 IDs per
+      call and silently skips IDs that don't exist or are already deleted.
+    • Messages older than 48 hours cannot be deleted by bots; those IDs are
+      simply skipped — we report how many were actually removed.
+    • CHAT_ADMIN_REQUIRED / not enough rights → clear Arabic error shown once.
+
+    Admin-only: only group administrators may use this command.
+    """
+    msg = update.message
+    if not msg:
+        return
+
+    user = msg.from_user
+    if not await _is_admin(context.bot, msg.chat.id, user.id):
+        await msg.reply_text("❌ هذا الأمر للمشرفين فقط.")
+        return
+
+    # ── Parse the count ────────────────────────────────────────────────────────
+    # /clear uses context.args (PTB strips the command prefix).
+    # Arabic مسح needs a regex search in the raw text.
+    count = 100  # default
+    if context.args:
+        try:
+            count = max(1, min(int(context.args[0]), 100))
+        except (ValueError, IndexError):
+            pass
+    else:
+        text = (msg.text or "").strip()
+        m = re.search(r"\b(\d+)\b", text)
+        if m:
+            count = max(1, min(int(m.group(1)), 100))
+
+    # ── Build the list of IDs to delete ────────────────────────────────────────
+    # Use msg.message_id as the upper bound; go back `count` steps so the
+    # command message itself is included in the count (nothing is left behind).
+    upper = msg.message_id
+    lower = max(1, upper - count + 1)
+    ids   = list(range(lower, upper + 1))   # up to `count` IDs
+
+    # ── Delete in chunks of 100 (Telegram per-call limit) ─────────────────────
+    no_permission = False
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
+        try:
+            await context.bot.delete_messages(msg.chat.id, chunk)
+        except TelegramError as exc:
+            err = str(exc).lower()
+            if "not enough rights" in err or "forbidden" in err or "admin" in err:
+                no_permission = True
+                break
+            # Any other error (message not found, too old) is silently skipped
+            # because delete_messages already ignores undeletable individual IDs.
+
+    # ── Outcome feedback ───────────────────────────────────────────────────────
+    if no_permission:
+        await context.bot.send_message(
+            msg.chat.id,
+            "❌ لا أملك صلاحية حذف الرسائل.\n"
+            "يرجى منح البوت صلاحية *حذف الرسائل* من إعدادات المشرفين.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Brief auto-deleting confirmation (disappears after 5 s)
+    note = await context.bot.send_message(
+        msg.chat.id, f"✅ تم حذف {count} رسالة."
+    )
+    await asyncio.sleep(5)
+    try:
+        await note.delete()
+    except Exception:
+        pass
+
+
 # ── Arabic trigger dispatcher ──────────────────────────────────────────────────
 
 async def arabic_trigger_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -655,10 +743,12 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("mute",   _handle_mute,   filters=group_filter))
     app.add_handler(CommandHandler("unmute", _handle_unmute, filters=group_filter))
     app.add_handler(CommandHandler("sync",   _handle_sync,   filters=group_filter))
+    app.add_handler(CommandHandler("clear",  _handle_clear,  filters=group_filter))
 
     # Arabic text triggers
-    app.add_handler(MessageHandler(group_filter & _AR_MOD_FILTER, arabic_trigger_handler))
-    app.add_handler(MessageHandler(group_filter & _AR_SYNC_FILTER, _handle_sync))
+    app.add_handler(MessageHandler(group_filter & _AR_MOD_FILTER,   arabic_trigger_handler))
+    app.add_handler(MessageHandler(group_filter & _AR_SYNC_FILTER,  _handle_sync))
+    app.add_handler(MessageHandler(group_filter & _AR_CLEAR_FILTER, _handle_clear))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(_cb_unmute, pattern=r"^unmute_\d+$"))
