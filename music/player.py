@@ -495,66 +495,72 @@ def set_bot(bot) -> None:
 
 async def _ensure_assistant_in_chat(chat_id: int) -> bool:
     """
-    Guarantee @HelpQaed (id=7769827870) is a member of *chat_id* AND that
-    the chat peer is resolved in Pyrogram's internal MTProto cache.
+    Guarantee @HelpQaed is a member of *chat_id* AND that its peer is
+    resolved in Pyrogram's internal MTProto cache.
 
-    Why "add_chat_member" is NOT used
-    ----------------------------------
-    The Telegram Bot API forbids bots from adding arbitrary users to groups
-    unless that user has previously started the bot — which the userbot account
-    almost certainly has not.  The call therefore fails with USER_NOT_MUTUAL_CONTACT
-    or similar errors.  Instead, the Pyrogram userbot joins the group *itself*
-    using the group's @username or invite link, which is the correct MTProto flow.
+    Why Pyrogram peer caching matters
+    -----------------------------------
+    Pyrogram needs an ``InputPeer`` cached locally before any MTProto call
+    for a chat succeeds.  ``resolve_peer()`` is the canonical check.  A fresh
+    session that hasn't seen a chat yet fails even ``get_chat(chat_id)`` with
+    "Peer id invalid".
+
+    Why ``add_chat_member`` is NOT used
+    -------------------------------------
+    The Bot API blocks bots from adding users who haven't started the bot
+    (USER_NOT_MUTUAL_CONTACT / USER_PRIVACY_RESTRICTED).  The userbot must
+    join the group *itself* using the group's @username or invite link.
 
     Flow
     ----
-    1. Pyrogram fast-path    — ``resolve_peer()`` succeeds → already ready.
-    2. PTB membership check  — ``get_chat_member(chat_id, ASSISTANT_USER_ID)``
-                               tells us the current status without needing the
-                               Pyrogram cache.
-    3. If NOT a member       — collect the group's @username and invite link
-                               (exported by the bot if needed), then have the
-                               userbot self-join via those identifiers.
-    4. Cache-warm poll       — ``resolve_peer()`` retried every second for up
-                               to 8 s; covers the delay between a successful
-                               ``join_chat`` call and Pyrogram receiving the
-                               MTProto membership update.
+    1. Fast path     — ``resolve_peer()`` already cached → return True.
+    2. PTB check     — ``get_chat_member(ASSISTANT_USER_ID)`` to learn current
+                       membership status without touching Pyrogram's cache.
+    3. Self-join     — Skipped when already a member.  Collects @username and
+                       invite link from the PTB bot (exports a fresh link if
+                       needed), then tries each identifier in order:
+                         a. @username  — works for public groups/supergroups.
+                         b. invite link — works for private groups.
+                       ``USER_ALREADY_PARTICIPANT`` from ``join_chat`` is
+                       treated as "already a member, cache just cold" and
+                       skips to the poll immediately.
+    4. Cache poll    — ``resolve_peer()`` retried every second for up to 10 s.
+                       Covers the MTProto round-trip delay between a successful
+                       ``join_chat`` and Pyrogram receiving the update.
 
-    Returns True when the assistant is confirmed ready; False when every
-    strategy failed (caller surfaces a clear Arabic error to the user).
+    Returns True when ready; False when every strategy failed.
     """
     if assistant is None:
         return False
 
     import config as _config
 
-    # ── Fast path: peer already in Pyrogram's local cache ────────────────────
+    # ── 1. Fast path: peer already cached ────────────────────────────────────
     try:
         await assistant.resolve_peer(chat_id)
         logger.debug(
-            "_ensure_assistant_in_chat(%s): @%s peer already resolved ✓",
-            chat_id, _config.ASSISTANT_USERNAME,
+            "_ensure_assistant_in_chat(%s): peer already cached ✓", chat_id,
         )
         return True
     except Exception:
         pass
 
     logger.info(
-        "_ensure_assistant_in_chat(%s): @%s peer not cached — checking membership",
-        chat_id, _config.ASSISTANT_USERNAME,
+        "_ensure_assistant_in_chat(%s): peer not cached — checking membership",
+        chat_id,
     )
 
-    # ── PTB membership check (no Pyrogram cache needed) ──────────────────────
+    # ── 2. PTB membership check (no Pyrogram cache required) ─────────────────
     already_member = False
     if _ptb_bot is not None:
         try:
-            cm = await _ptb_bot.get_chat_member(chat_id, _config.ASSISTANT_USER_ID)
+            cm     = await _ptb_bot.get_chat_member(chat_id, _config.ASSISTANT_USER_ID)
             status = str(cm.status).lower()
-            if "left" not in status and "kicked" not in status and "banned" not in status:
+            if not any(s in status for s in ("left", "kicked", "banned")):
                 already_member = True
                 logger.info(
-                    "_ensure_assistant_in_chat(%s): @%s already a member (status=%s) "
-                    "— cache is cold, polling to warm it",
+                    "_ensure_assistant_in_chat(%s): @%s already a member "
+                    "(status=%s) — cache cold, polling to warm it",
                     chat_id, _config.ASSISTANT_USERNAME, cm.status,
                 )
         except Exception as exc:
@@ -563,13 +569,11 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
                 chat_id, exc,
             )
 
-    # ── Self-join strategies (skipped when already a member) ─────────────────
+    # ── 3. Self-join (skipped when already a member) ──────────────────────────
     if not already_member:
-        # Collect the group's @username and invite link from the PTB bot.
-        # These identifiers let the userbot join without needing the peer to be
-        # pre-cached — avoiding the chicken-and-egg bare-id problem.
+        # Collect identifiers that let the userbot join without a pre-cached peer.
         group_username: str | None = None
-        invite_link: str | None = None
+        invite_link:    str | None = None
 
         if _ptb_bot is not None:
             try:
@@ -579,9 +583,8 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
             except Exception as exc:
                 logger.debug("PTB get_chat(%s) failed: %s", chat_id, exc)
 
-            # If the chat has no invite_link yet (bot is admin but link not
-            # exported), generate one explicitly.
-            if not invite_link and not group_username and _ptb_bot is not None:
+            # Generate a fresh invite link for private groups where none exists yet.
+            if not group_username and not invite_link:
                 try:
                     invite_link = await _ptb_bot.export_chat_invite_link(chat_id)
                     logger.debug(
@@ -594,72 +597,69 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
                         chat_id, exc,
                     )
 
-        logger.info(
-            "_ensure_assistant_in_chat(%s): @%s not a member — "
-            "group_username=%r invite_link=%s",
-            chat_id, _config.ASSISTANT_USERNAME,
-            group_username, bool(invite_link),
-        )
-
-        # Strategy A: self-join via group @username (public groups / supergroups)
+        # Build the ordered list of identifiers to try.
+        identifiers = []
         if group_username:
-            try:
-                await assistant.join_chat(f"@{group_username.lstrip('@')}")
-                logger.info(
-                    "@%s joined chat %s via group @%s",
-                    _config.ASSISTANT_USERNAME, chat_id, group_username,
-                )
-                await asyncio.sleep(1.5)
-                try:
-                    await assistant.resolve_peer(chat_id)
-                    return True
-                except Exception:
-                    pass  # fall through to cache-warm poll below
-            except Exception as exc:
-                logger.debug(
-                    "join_chat by @%s (group) failed for chat %s: %s",
-                    group_username, chat_id, exc,
-                )
-
-        # Strategy B: self-join via invite link (private groups)
+            identifiers.append(f"@{group_username.lstrip('@')}")
         if invite_link:
-            try:
-                await assistant.join_chat(invite_link)
-                logger.info(
-                    "@%s joined chat %s via invite link",
-                    _config.ASSISTANT_USERNAME, chat_id,
-                )
-                await asyncio.sleep(1.5)
-                try:
-                    await assistant.resolve_peer(chat_id)
-                    return True
-                except Exception:
-                    pass  # fall through to cache-warm poll below
-            except Exception as exc:
-                logger.debug(
-                    "join_chat by invite link failed for chat %s: %s", chat_id, exc,
-                )
+            identifiers.append(invite_link)
 
-        if not group_username and not invite_link:
-            # No identifier available — cannot self-join a private group without
-            # a link.  Return False so the caller can surface a clear error.
+        if not identifiers:
+            # Private group with no accessible invite link — cannot auto-join.
             logger.warning(
-                "_ensure_assistant_in_chat(%s): no @username or invite link available "
-                "— @%s cannot join this private group automatically. "
-                "Add @%s to the group manually.",
-                chat_id, _config.ASSISTANT_USERNAME, _config.ASSISTANT_USERNAME,
+                "_ensure_assistant_in_chat(%s): no @username or invite link — "
+                "@%s cannot auto-join. Add it to the group manually.",
+                chat_id, _config.ASSISTANT_USERNAME,
             )
             return False
 
-    # ── Cache-warm poll ───────────────────────────────────────────────────────
-    # After joining (or when already a member with a cold cache), Pyrogram needs
-    # time to receive the MTProto update that populates the peer cache entry.
-    for attempt in range(8):
+        logger.info(
+            "_ensure_assistant_in_chat(%s): @%s not a member — "
+            "trying %d identifier(s): %s",
+            chat_id, _config.ASSISTANT_USERNAME,
+            len(identifiers), identifiers,
+        )
+
+        for identifier in identifiers:
+            try:
+                await assistant.join_chat(identifier)
+                logger.info(
+                    "@%s joined chat %s via %r",
+                    _config.ASSISTANT_USERNAME, chat_id, identifier,
+                )
+                await asyncio.sleep(2.0)
+                try:
+                    await assistant.resolve_peer(chat_id)
+                    return True          # joined + cached immediately
+                except Exception:
+                    break               # joined but cache not warm yet → poll
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "already" in exc_str or "participant" in exc_str:
+                    # USER_ALREADY_PARTICIPANT: the userbot IS in the group but
+                    # this Pyrogram session hasn't cached that peer yet.
+                    logger.info(
+                        "@%s is already a participant of chat %s "
+                        "(caught from join_chat) — warming cache",
+                        _config.ASSISTANT_USERNAME, chat_id,
+                    )
+                    already_member = True   # skip remaining identifiers
+                    break
+                logger.debug(
+                    "join_chat(%r) for chat %s failed: %s",
+                    identifier, chat_id, exc,
+                )
+                # Try the next identifier (invite link) if username failed.
+
+    # ── 4. Cache-warm poll ────────────────────────────────────────────────────
+    # Pyrogram receives the membership update asynchronously; poll until
+    # resolve_peer() succeeds or we time out (10 s).
+    for attempt in range(10):
         await asyncio.sleep(1.0)
         try:
             await assistant.resolve_peer(chat_id)
             logger.info(
-                "Peer %s resolved for @%s (attempt %d/8)",
+                "Peer %s resolved for @%s (attempt %d/10)",
                 chat_id, _config.ASSISTANT_USERNAME, attempt + 1,
             )
             return True
@@ -667,7 +667,7 @@ async def _ensure_assistant_in_chat(chat_id: int) -> bool:
             pass
 
     logger.warning(
-        "_ensure_assistant_in_chat(%s): @%s peer still unresolvable after 8 s poll — "
+        "_ensure_assistant_in_chat(%s): @%s peer still unresolvable after 10 s — "
         "the userbot may have joined but Pyrogram hasn't processed the update yet.",
         chat_id, _config.ASSISTANT_USERNAME,
     )
@@ -717,58 +717,74 @@ async def _create_voice_chat(chat_id: int) -> None:
 
 async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     """
-    Robustly join the voice chat for *chat_id*, handling every common failure:
+    Robustly join the voice chat for *chat_id*, with full auto-join and
+    auto-create behaviour:
 
-      1. Ensure the assistant is a member and the peer is cached (auto-join).
-         Raises RuntimeError immediately if every join strategy fails.
-      2. Call join_group_call().
-      3. If "peer id invalid" / "not in group" — re-ensure membership and retry.
-      4. If "no active voice chat" — create one via MTProto and retry.
+    Step 1 — Membership + peer cache
+        ``_ensure_assistant_in_chat`` auto-joins the group via @username or
+        invite link when the userbot isn't a member yet.  Raises RuntimeError
+        if every strategy fails (caller surfaces the Arabic error).
 
-    All retries happen at most once to avoid infinite loops.
+    Step 2 — Proactive voice-chat creation
+        Always call ``_create_voice_chat`` before joining.  If a call is
+        already active, ``GROUPCALL_ALREADY_STARTED`` is silently swallowed
+        inside that helper — no harm done.  This removes the need to detect
+        "no active call" errors reactively and makes the startup path explicit.
+
+    Step 3 — join_group_call with a single retry
+        * "already in call" / "already joined" → the assistant is already
+          streaming; switch to ``change_stream`` instead of joining again.
+        * Peer / membership keyword             → re-ensure membership once,
+          then retry ``join_group_call``.
+        * Anything else                         → re-raise unchanged.
     """
     # ── Step 1: guarantee membership + peer cache ─────────────────────────────
     ready = await _ensure_assistant_in_chat(chat_id)
     if not ready:
         raise RuntimeError(
             "⚠️ تعذّر على الحساب المساعد @HelpQaed الانضمام إلى المجموعة.\n"
-            "• تأكد من أن البوت الرئيسي مسؤول (admin) في المجموعة وله صلاحية إضافة الأعضاء.\n"
-            "• أو أضف @HelpQaed إلى المجموعة يدويًا.\n"
+            "• أضف @HelpQaed إلى المجموعة يدويًا، أو تأكد أن البوت مسؤول "
+            "وله صلاحية دعوة الأعضاء.\n"
             "• ثم أعد المحاولة بأمر /play."
         )
 
-    # ── Step 2: first join_group_call attempt ─────────────────────────────────
-    try:
-        await call_py.join_group_call(chat_id, stream)
-        return
-    except Exception as exc:
-        err = str(exc).lower()
+    # ── Step 2: ensure a voice chat exists (proactive, idempotent) ───────────
+    # _create_voice_chat silently ignores GROUPCALL_ALREADY_STARTED, so it is
+    # safe to call even when a call is already running.
+    await _create_voice_chat(chat_id)
 
-        # ── Peer / membership error: re-ensure and retry once ─────────────────
-        if any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
-            logger.info(
-                "join_group_call(%s) peer/membership error (%s) — re-ensuring and retrying",
-                chat_id, exc,
-            )
-            await _ensure_assistant_in_chat(chat_id)
-            try:
-                await call_py.join_group_call(chat_id, stream)
-                return
-            except Exception as exc2:
-                err = str(exc2).lower()
-                exc = exc2  # fall through to the voice-chat check below
-
-        # ── No active voice chat: create one and retry ────────────────────────
-        if any(kw in err for kw in _NO_CALL_KEYWORDS):
-            logger.info(
-                "No active voice chat in chat %s (%s) — creating one and retrying",
-                chat_id, exc,
-            )
-            await _create_voice_chat(chat_id)
+    # ── Step 3: join the call (with one membership-error retry) ───────────────
+    for attempt in range(2):
+        try:
             await call_py.join_group_call(chat_id, stream)
+            logger.info(
+                "Joined voice call in chat %s (attempt %d)", chat_id, attempt + 1,
+            )
             return
+        except Exception as exc:
+            err = str(exc).lower()
 
-        raise  # unrelated error — surface it unchanged
+            # The userbot is already streaming in this call — swap the stream.
+            if "already" in err or "joined" in err:
+                logger.info(
+                    "Already in voice call for chat %s — switching stream via change_stream",
+                    chat_id,
+                )
+                await call_py.change_stream(chat_id, stream)
+                return
+
+            # Peer / membership error on first attempt — re-ensure and retry.
+            if attempt == 0 and any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
+                logger.info(
+                    "join_group_call(%s) peer/membership error (%s) "
+                    "— re-ensuring membership and retrying",
+                    chat_id, exc,
+                )
+                await _ensure_assistant_in_chat(chat_id)
+                continue  # second iteration of the loop
+
+            # Unrelated error, or second attempt also failed — surface it.
+            raise
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
