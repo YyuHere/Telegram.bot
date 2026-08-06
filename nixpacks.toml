@@ -1,0 +1,11 @@
+# Nixpacks build configuration for Railway / Nixpacks-based deployments.
+# This is a Python project (Telegram music bot), NOT a Node.js project.
+
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg", "gcc", "g++"]
+
+[phases.install]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
+
+[start]
+cmd = "python main.py"
