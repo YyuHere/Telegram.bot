@@ -486,6 +486,12 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # logger (see _YtdlpDiagnosticLogger) instead of being discarded.
         "no_warnings": False,
         "logger": _YtdlpDiagnosticLogger(",".join(player_clients)),
+        # yt-dlp only tries Deno for its JS challenge solver (EJS) by
+        # default — it will NOT fall back to Node even if Node is on PATH.
+        # The Dockerfile installs nodejs/npm (no Deno), so without this the
+        # signature/n-parameter challenges silently fail on every client,
+        # which is what was happening. https://github.com/yt-dlp/yt-dlp/wiki/EJS
+        "js_runtimes": {"node": {}},
         "noplaylist": True,
         # ytsearchN returns up to N results as a "playlist". Without this,
         # a single unplayable result anywhere in that batch (no formats on
