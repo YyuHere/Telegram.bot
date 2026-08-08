@@ -2,7 +2,11 @@
 # This is a Python project (Telegram music bot), NOT a Node.js project.
 
 [phases.setup]
-nixPkgs = ["python311", "ffmpeg", "gcc", "g++"]
+# "deno" added: yt-dlp now requires an external JavaScript runtime (EJS) to
+# solve YouTube's signature/n-parameter challenges. Without it, yt-dlp
+# cannot resolve playable format URLs for most videos on any client.
+# https://github.com/yt-dlp/yt-dlp/wiki/EJS
+nixPkgs = ["python311", "ffmpeg", "gcc", "g++", "deno"]
 
 [phases.install]
 cmds = ["pip install --no-cache-dir -r requirements.txt"]
