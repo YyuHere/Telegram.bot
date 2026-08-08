@@ -363,6 +363,53 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
+def _resolve_cookie_file() -> str | None:
+    """
+    Return a filesystem path to a Netscape-format cookies.txt for yt-dlp, or
+    None if no cookies are configured.
+
+    Two ways to supply cookies (checked in this order):
+
+      1. YTDLP_COOKIES_CONTENT — the *raw contents* of cookies.txt pasted
+         directly into a Railway/host environment variable.  This is the
+         recommended approach: it needs no file in the repo or a Railway
+         Volume, so the cookies (which are equivalent to a live login
+         session) never touch source control.  On each call the content is
+         written to a temp file once and the cached path is reused.
+
+      2. YTDLP_COOKIES_FILE — a path to an existing cookies.txt already
+         present on disk (e.g. committed to the repo or mounted via a
+         Railway Volume).  Kept for backward compatibility.
+    """
+    global _cookie_file_cache
+
+    content = _os.environ.get("YTDLP_COOKIES_CONTENT", "").strip()
+    if content:
+        if _cookie_file_cache and _os.path.isfile(_cookie_file_cache):
+            return _cookie_file_cache
+        try:
+            import tempfile
+            fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                if not content.endswith("\n"):
+                    f.write("\n")
+            _cookie_file_cache = path
+            logger.info("yt-dlp cookies loaded from YTDLP_COOKIES_CONTENT (%s)", path)
+            return path
+        except Exception as exc:
+            logger.warning("Failed to materialize YTDLP_COOKIES_CONTENT to a temp file: %s", exc)
+
+    file_path = _os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if file_path and _os.path.isfile(file_path):
+        return file_path
+
+    return None
+
+
+_cookie_file_cache: str | None = None
+
+
 def _ydl_opts(extra: dict | None = None) -> dict:
     """
     Build yt-dlp options with realistic browser headers and the YouTube
@@ -387,8 +434,8 @@ def _ydl_opts(extra: dict | None = None) -> dict:
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
         },
     }
-    cookie_file = _os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookie_file and _os.path.isfile(cookie_file):
+    cookie_file = _resolve_cookie_file()
+    if cookie_file:
         opts["cookiefile"] = cookie_file
     if extra:
         opts.update(extra)
