@@ -18,7 +18,7 @@ py-tgcalls==2.2.11
 # almost as often. An old pinned version falls behind fast — bump this
 # floor periodically to whatever the latest stable release actually is
 # (check: pip index versions yt-dlp).
-yt-dlp>=2026.7.4
+yt-dlp[default]>=2026.7.4
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
 spotipy==2.24.0
