@@ -410,16 +410,25 @@ def _resolve_cookie_file() -> str | None:
 _cookie_file_cache: str | None = None
 
 
-# Client fallback order for the current (2026) SABR-enforcement landscape:
-#   1. tv       — no PO Token needed, but only reliably exposes itag 18 (360p muxed).
-#   2. android  — occasionally still returns a fuller format list; used only if
-#                 "tv" raises (e.g. video unavailable on that client).
+# Client fallback order for the current (2026) SABR-enforcement landscape.
+# No single client is reliable for every video — YouTube's SABR rollout is
+# uneven per-video/per-region, and yt-dlp's own client support shifts often
+# (e.g. "tv_embedded" was removed as broken in Jan 2026). So instead of
+# betting on one client, try several in order and only give up once all of
+# them return zero usable formats:
+#   1. tv         — no PO Token needed; usually exposes itag 18 (360p muxed).
+#   2. android_vr — yt-dlp's own current default fallback; often still gets
+#                   a full adaptiveFormats list without a PO Token.
+#   3. android    — occasionally succeeds where the above don't.
+#   4. mweb       — mobile web; sometimes exposes formats "web" no longer does.
 # "web" and "ios" are deliberately NOT in this list: web is SABR-blocked and
-# ios needs a PO Token, so both fail immediately in most environments and just
-# waste a network round-trip before falling through.
+# ios needs a PO Token, so both fail immediately in most environments and
+# just waste a network round-trip before falling through.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
     ("tv",),
+    ("android_vr",),
     ("android",),
+    ("mweb",),
 )
 
 
@@ -430,17 +439,18 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
 
     YouTube began forcing SABR streaming on the "web" client in 2026, which
     removed the direct adaptiveFormats playback URLs yt-dlp relied on. "ios"
-    and "android" still work but require a PO Token to unlock full quality.
-    The "tv" client is the documented workaround: it still returns a plain
-    HTTPS URL (itag 18, 360p muxed video+audio) with no PO Token needed, so
-    it's used as the default here. See:
+    still requires a PO Token to unlock formats. Which of the remaining
+    clients (tv / android_vr / android / mweb) actually returns usable
+    formats varies by video and changes over time, so no single format
+    string can assume itag 18 will always be there — "best" is left as the
+    final catch-all rather than hard-requiring it. See:
     https://github.com/yt-dlp/yt-dlp/issues/12482
     """
     opts: dict = {
-        # itag 18 is what the tv/android clients actually hand back right
-        # now, so it's an explicit fallback rather than relying on "best"
-        # to happen to select it.
-        "format": "bestaudio/best[acodec!=none]/18/best",
+        # No specific itag is guaranteed across clients, so prefer an
+        # audio-only stream when one exists and otherwise fall through to
+        # whatever the client actually returns.
+        "format": "bestaudio/best[acodec!=none]/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
