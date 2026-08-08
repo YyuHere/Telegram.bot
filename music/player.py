@@ -1198,14 +1198,25 @@ def current_track(chat_id: int) -> TrackInfo | None:
 
 
 # ─── pytgcalls event: stream ended ────────────────────────────────────────────
+#
+# py-tgcalls 2.x (ntgcalls-based rewrite) removed the old @call_py.on_stream_end()
+# decorator. All voice-chat events now flow through a single @call_py.on_update()
+# handler, and you filter for the event type you care about with isinstance().
 
 if call_py is not None:
-    @call_py.on_stream_end()
-    async def _on_stream_end(client, update) -> None:  # type: ignore[misc]
+    from pytgcalls.types import Update
+    from pytgcalls.types.stream import StreamAudioEnded
+
+    @call_py.on_update()
+    async def _on_pytgcalls_update(client, update: Update) -> None:  # type: ignore[misc]
         """
-        Called by pytgcalls when the current stream finishes.
-        Handles repeat mode and auto-play of the next queued track.
+        Called by pytgcalls on every voice-chat event (join, left, kicked,
+        stream ended, etc.). We only act on StreamAudioEnded — handles repeat
+        mode and auto-play of the next queued track.
         """
+        if not isinstance(update, StreamAudioEnded):
+            return
+
         try:
             chat_id: int = update.chat_id
         except AttributeError:
