@@ -1204,17 +1204,19 @@ def current_track(chat_id: int) -> TrackInfo | None:
 # handler, and you filter for the event type you care about with isinstance().
 
 if call_py is not None:
-    from pytgcalls.types import Update
-    from pytgcalls.types.stream import StreamAudioEnded
-
     @call_py.on_update()
-    async def _on_pytgcalls_update(client, update: Update) -> None:  # type: ignore[misc]
+    async def _on_pytgcalls_update(client, update) -> None:  # type: ignore[misc]
         """
         Called by pytgcalls on every voice-chat event (join, left, kicked,
-        stream ended, etc.). We only act on StreamAudioEnded — handles repeat
-        mode and auto-play of the next queued track.
+        stream ended, etc.). We only act when the stream finished.
+
+        Matched by class *name* (not isinstance) because the exact import
+        path for the "stream ended" event type differs across py-tgcalls
+        versions/builds (StreamAudioEnded vs StreamEnded, different
+        sub-modules, etc.) — matching the name avoids an ImportError that
+        would crash the whole module at startup if the wrong path is picked.
         """
-        if not isinstance(update, StreamAudioEnded):
+        if type(update).__name__ not in ("StreamAudioEnded", "StreamEnded", "StreamVideoEnded"):
             return
 
         try:
