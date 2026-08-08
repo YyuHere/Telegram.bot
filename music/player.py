@@ -410,25 +410,42 @@ def _resolve_cookie_file() -> str | None:
 _cookie_file_cache: str | None = None
 
 
-def _ydl_opts(extra: dict | None = None) -> dict:
+# Client fallback order for the current (2026) SABR-enforcement landscape:
+#   1. tv       — no PO Token needed, but only reliably exposes itag 18 (360p muxed).
+#   2. android  — occasionally still returns a fuller format list; used only if
+#                 "tv" raises (e.g. video unavailable on that client).
+# "web" and "ios" are deliberately NOT in this list: web is SABR-blocked and
+# ios needs a PO Token, so both fail immediately in most environments and just
+# waste a network round-trip before falling through.
+_CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
+    ("tv",),
+    ("android",),
+)
+
+
+def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv",)) -> dict:
     """
-    Build yt-dlp options with realistic browser headers and the YouTube
-    web player client to reduce bot-detection blocking.
+    Build yt-dlp options with realistic browser headers and a YouTube player
+    client that survives SABR-only enforcement.
+
+    YouTube began forcing SABR streaming on the "web" client in 2026, which
+    removed the direct adaptiveFormats playback URLs yt-dlp relied on. "ios"
+    and "android" still work but require a PO Token to unlock full quality.
+    The "tv" client is the documented workaround: it still returns a plain
+    HTTPS URL (itag 18, 360p muxed video+audio) with no PO Token needed, so
+    it's used as the default here. See:
+    https://github.com/yt-dlp/yt-dlp/issues/12482
     """
     opts: dict = {
-        # Wider fallback chain: prefer bestaudio, then best-audio-only m4a,
-        # then any combined format, then literally anything. Logged-in
-        # sessions (via cookies) sometimes expose a different/smaller format
-        # list than anonymous requests, so a strict "bestaudio/best" selector
-        # can come back empty — this chain avoids that failure mode.
-        "format": "bestaudio/best[acodec!=none]/best/bestaudio*",
+        # itag 18 is what the tv/android clients actually hand back right
+        # now, so it's an explicit fallback rather than relying on "best"
+        # to happen to select it.
+        "format": "bestaudio/best[acodec!=none]/18/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Use the web player client — avoids signature-cipher blocks that the
-        # android/iOS clients increasingly hit on certain regions.
         "extractor_args": {
-            "youtube": {"player_client": ["web", "android", "ios"]},
+            "youtube": {"player_client": list(player_clients)},
         },
         "http_headers": {
             "User-Agent": (
@@ -445,6 +462,36 @@ def _ydl_opts(extra: dict | None = None) -> dict:
     if extra:
         opts.update(extra)
     return opts
+
+
+def _extract_info_with_fallback(target: str, extra: dict | None = None) -> dict | None:
+    """
+    Run yt_dlp.extract_info(target) trying each client in
+    _CLIENT_FALLBACK_CHAIN in order, returning the first successful result.
+
+    Centralizes the SABR-workaround retry logic so every caller (search,
+    direct URL resolution) benefits automatically without duplicating the
+    try/except chain. Returns None if every client fails; the specific
+    exception from the last attempt is logged at WARNING level.
+    """
+    last_exc: Exception | None = None
+    for clients in _CLIENT_FALLBACK_CHAIN:
+        opts = _ydl_opts(extra, player_clients=clients)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(target, download=False)
+        except Exception as exc:
+            last_exc = exc
+            logger.debug(
+                "extract_info(%r) failed with client(s) %s: %s",
+                target, clients, exc,
+            )
+    if last_exc is not None:
+        logger.warning(
+            "extract_info(%r) failed on all client fallbacks: %s",
+            target, last_exc,
+        )
+    return None
 
 
 def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
@@ -502,17 +549,14 @@ def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo |
     if len(words) > 4:
         _add(" ".join(words[:4]))
 
-    opts = _ydl_opts()
     for q in variants:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch5:{q}", download=False)
-            track = _extract_track(info, q, source_tag)
-            if track:
-                logger.info("YouTube search: found %r for query %r", track["title"], q)
-                return track
-        except Exception as exc:
-            logger.warning("YouTube search failed for %r: %s", q, exc)
+        info = _extract_info_with_fallback(f"ytsearch5:{q}")
+        if info is None:
+            continue
+        track = _extract_track(info, q, source_tag)
+        if track:
+            logger.info("YouTube search: found %r for query %r", track["title"], q)
+            return track
 
     return None
 
@@ -527,14 +571,10 @@ def get_best_audio_url(url_or_id: str) -> "TrackInfo | None":
     if not url_or_id.startswith("http"):
         url_or_id = f"https://www.youtube.com/watch?v={url_or_id}"
 
-    opts = _ydl_opts()
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url_or_id, download=False)
-        return _extract_track(info, url_or_id, SOURCE_YOUTUBE)
-    except Exception as exc:
-        logger.warning("get_best_audio_url(%r) failed: %s", url_or_id, exc)
+    info = _extract_info_with_fallback(url_or_id)
+    if info is None:
         return None
+    return _extract_track(info, url_or_id, SOURCE_YOUTUBE)
 
 
 # ─── Stage 2: Spotify metadata ────────────────────────────────────────────────
@@ -667,15 +707,11 @@ def get_audio_info(query: str) -> TrackInfo:
         else:
             tag = SOURCE_YOUTUBE
 
-        opts = _ydl_opts()
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_fallback(url)
+        if info is not None:
             track = _extract_track(info, url, tag)
             if track:
                 return track
-        except Exception as exc:
-            pass
 
         raise RuntimeError(
             "❌ تعذّر استخراج الصوت من هذا الرابط.\n"
