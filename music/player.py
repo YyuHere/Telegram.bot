@@ -429,7 +429,37 @@ _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
     ("android_vr",),
     ("android",),
     ("mweb",),
+    ("web_safari",),
+    ("web_embedded",),
 )
+
+
+class _YtdlpDiagnosticLogger:
+    """
+    Forwards yt-dlp's internal debug/warning/error messages into our own
+    logger instead of letting them vanish behind quiet=True/no_warnings=True.
+
+    Those internal messages ("YouTube is forcing SABR streaming for this
+    client", "Some formats may be missing", PO Token complaints, cookie
+    errors, etc.) are the ONLY place the *actual* reason a client failed
+    shows up — the generic "Requested format is not available" exception
+    string alone is not enough to tell SABR-block apart from a bad cookie,
+    a genuinely unavailable video, or a PO Token requirement. debug() is
+    intentionally dropped (too noisy — includes per-request URLs); warning()
+    and error() are the ones worth keeping.
+    """
+
+    def __init__(self, client_label: str) -> None:
+        self._client_label = client_label
+
+    def debug(self, msg: str) -> None:  # noqa: D401 - yt-dlp calls this a lot; ignore
+        pass
+
+    def warning(self, msg: str) -> None:
+        logger.warning("yt-dlp[%s]: %s", self._client_label, msg)
+
+    def error(self, msg: str) -> None:
+        logger.warning("yt-dlp[%s] ERROR: %s", self._client_label, msg)
 
 
 def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv",)) -> dict:
@@ -452,7 +482,10 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # whatever the client actually returns.
         "format": "bestaudio/best[acodec!=none]/best",
         "quiet": True,
-        "no_warnings": True,
+        # Messages are still captured — just routed through our own
+        # logger (see _YtdlpDiagnosticLogger) instead of being discarded.
+        "no_warnings": False,
+        "logger": _YtdlpDiagnosticLogger(",".join(player_clients)),
         "noplaylist": True,
         # ytsearchN returns up to N results as a "playlist". Without this,
         # a single unplayable result anywhere in that batch (no formats on
