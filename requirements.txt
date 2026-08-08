@@ -13,15 +13,10 @@ tgcrypto==1.2.5
 py-tgcalls==2.2.11
 
 # Audio download / stream URL resolution
-# Pinned to a floor, not a ceiling: YouTube's SABR enforcement changes which
-# player clients still work every few weeks, and yt-dlp ships fixes for it
-# almost as often. An old pinned version falls behind fast — bump this
-# floor periodically to whatever the latest stable release actually is
-# (check: pip index versions yt-dlp).
 yt-dlp[default]>=2026.7.4
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
 spotipy==2.24.0
 
 # HTTP client — used for Anghami search API (Stage 3 fallback)
-requests==2.31.0
+requests>=2.32.2,<3
