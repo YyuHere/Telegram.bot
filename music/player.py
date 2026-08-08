@@ -21,6 +21,27 @@ from assistant.userbot import assistant
 
 logger = logging.getLogger(__name__)
 
+# ─── One-time startup diagnostic: is a JS runtime actually on PATH? ───────────
+# yt-dlp needs an external JS runtime (node/deno) to solve YouTube's
+# signature/n-parameter challenges. Logged once at import time so this shows
+# up right next to the other startup lines in Deploy Logs, instead of having
+# to infer it indirectly from every later "Signature solving failed" warning.
+_node_path = shutil.which("node")
+if _node_path:
+    try:
+        _node_version = subprocess.run(
+            [_node_path, "--version"], capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception as _node_exc:
+        _node_version = f"(version check failed: {_node_exc})"
+    logger.info("JS runtime check: node found at %s (%s)", _node_path, _node_version)
+else:
+    logger.warning(
+        "JS runtime check: 'node' NOT found on PATH — yt-dlp cannot solve "
+        "YouTube's signature/n-parameter challenges without a JS runtime. "
+        "Install nodejs in the Dockerfile/build image."
+    )
+
 # ─── pytgcalls setup ──────────────────────────────────────────────────────────
 # call_py is only created when the assistant (Pyrogram Client) exists.
 # Any import or instantiation failure is logged with a full traceback so the
@@ -452,8 +473,15 @@ class _YtdlpDiagnosticLogger:
     def __init__(self, client_label: str) -> None:
         self._client_label = client_label
 
-    def debug(self, msg: str) -> None:  # noqa: D401 - yt-dlp calls this a lot; ignore
-        pass
+    def debug(self, msg: str) -> None:
+        # Almost all debug() calls are per-request noise (URLs, headers), so
+        # those are still dropped. The exception: anything mentioning the JS
+        # runtime / EJS solver — that's exactly the info needed to tell
+        # whether yt-dlp found "node" at all, tried it, and why it did or
+        # didn't work. Those lines are rare enough not to flood the log.
+        lowered = msg.lower()
+        if any(kw in lowered for kw in ("js runtime", "js-runtime", "js_runtime", "ejs", "deno", "node")):
+            logger.warning("yt-dlp[%s] DEBUG: %s", self._client_label, msg)
 
     def warning(self, msg: str) -> None:
         logger.warning("yt-dlp[%s]: %s", self._client_label, msg)
