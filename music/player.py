@@ -416,14 +416,19 @@ def _ydl_opts(extra: dict | None = None) -> dict:
     web player client to reduce bot-detection blocking.
     """
     opts: dict = {
-        "format": "bestaudio/best",
+        # Wider fallback chain: prefer bestaudio, then best-audio-only m4a,
+        # then any combined format, then literally anything. Logged-in
+        # sessions (via cookies) sometimes expose a different/smaller format
+        # list than anonymous requests, so a strict "bestaudio/best" selector
+        # can come back empty — this chain avoids that failure mode.
+        "format": "bestaudio/best[acodec!=none]/best/bestaudio*",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         # Use the web player client — avoids signature-cipher blocks that the
         # android/iOS clients increasingly hit on certain regions.
         "extractor_args": {
-            "youtube": {"player_client": ["web"]},
+            "youtube": {"player_client": ["web", "android", "ios"]},
         },
         "http_headers": {
             "User-Agent": (
