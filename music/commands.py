@@ -5,8 +5,8 @@ Triggers:
   • /play <query>  — slash command
   • تشغيل <query> — Arabic text trigger
 
-Search: SoundCloud (primary). Direct audio URLs and other yt-dlp-supported
-        platform links are also accepted. YouTube is intentionally excluded.
+Search: YouTube first, then SoundCloud and metadata-guided fallbacks. Direct
+        audio URLs and other yt-dlp-supported platform links are also accepted.
 Response: Thumbnail photo + formatted caption + inline playback keyboard.
 Callbacks: ▶️ ⏸️ 🔄 ⏭️ ⏹️ buttons wired to PyTgCalls controls.
 """
@@ -207,12 +207,16 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except Exception as exc:
         logger.warning("Search failed for %r: %s", query, exc)
-        await status.edit_text(f"❌ لم يتم العثور على الأغنية. جرب اسمًا آخر.")
+        await status.edit_text(
+            "❌ لم يتم العثور على الأغنية في YouTube أو SoundCloud.\n"
+            "جرب اسمًا آخر أو أرسل رابطًا مباشرًا."
+        )
         return
 
     # ── Show source-specific progress message ─────────────────────────────────
     _source_msgs = {
         player.SOURCE_YOUTUBE: "🎵 جاري التشغيل من YouTube...",
+        player.SOURCE_SOUNDCLOUD: "☁️ جاري التشغيل من SoundCloud...",
         player.SOURCE_SPOTIFY: "🎧 تم العثور عبر Spotify، جاري التشغيل...",
         player.SOURCE_ANGHAMI: "🎶 جاري التشغيل من Anghami...",
     }

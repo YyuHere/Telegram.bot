@@ -329,6 +329,7 @@ def health_check() -> dict:
 # ─── Source constants ─────────────────────────────────────────────────────────
 
 SOURCE_YOUTUBE = "youtube"
+SOURCE_SOUNDCLOUD = "soundcloud"
 SOURCE_SPOTIFY = "spotify"   # Spotify metadata → YouTube stream
 SOURCE_ANGHAMI = "anghami"  # Anghami metadata → YouTube stream
 
@@ -521,6 +522,12 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # which is what was happening. https://github.com/yt-dlp/yt-dlp/wiki/EJS
         "js_runtimes": {"node": {}},
         "noplaylist": True,
+        # Network hiccups and provider throttling should move to the next
+        # client/provider instead of immediately surfacing "not found".
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 2,
+        "socket_timeout": 15,
         # ytsearchN returns up to N results as a "playlist". Without this,
         # a single unplayable result anywhere in that batch (no formats on
         # any client, region-locked, age-gated, etc.) raises immediately and
@@ -590,28 +597,88 @@ def _extract_info_with_fallback(target: str, extra: dict | None = None) -> dict 
     return None
 
 
-def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
+def _stream_url_from_info(info: dict) -> str:
     """
-    Pull the first usable entry from a yt-dlp result dict and return it as
-    a TrackInfo.  Returns None when no playable URL is found.
-    """
-    if "entries" in info:
-        entries = [e for e in (info.get("entries") or []) if e]
-        if not entries:
-            return None
-        info = entries[0]
+    Return a direct media URL from a yt-dlp info dict.
 
-    url: str = info.get("url") or info.get("webpage_url", "")
+    Search results are not guaranteed to be fully expanded.  In particular,
+    YouTube and SoundCloud may return an entry with only ``webpage_url`` while
+    the actual audio URL lives in ``formats``.  Never hand a webpage URL to
+    PyTgCalls: it expects a media stream that ffmpeg can open.
+    """
+    formats = info.get("formats") or []
+    candidates = [
+        fmt for fmt in formats
+        if fmt.get("url")
+        and fmt.get("acodec") not in (None, "none")
+        and fmt.get("protocol") not in ("m3u8", "m3u8_native", "http_dash_segments")
+    ]
+    if candidates:
+        # Prefer audio-only formats and then the highest audio bitrate.  The
+        # latter is useful for SoundCloud, where formats often have no abr but
+        # do expose tbr.
+        candidates.sort(
+            key=lambda fmt: (
+                fmt.get("vcodec") in (None, "none"),
+                fmt.get("abr") or 0,
+                fmt.get("tbr") or 0,
+            ),
+            reverse=True,
+        )
+        return candidates[0]["url"]
+
+    url = info.get("url") or ""
+    webpage_url = info.get("webpage_url") or info.get("original_url") or ""
+    if url and url != webpage_url:
+        # A fully expanded yt-dlp entry carries codec/protocol metadata. The
+        # URL can be an expiring CDN URL (or another provider's media URL), so
+        # do not restrict it to a hard-coded hostname list.
+        if (
+            info.get("acodec") not in (None, "none")
+            or info.get("protocol") in ("http", "https", "http_dash_segments")
+            or _is_direct_audio_url(url)
+        ):
+            return url
+    return ""
+
+
+def _track_from_entry(entry: dict, query: str, source: str) -> "TrackInfo | None":
+    """Build a track from one search entry, expanding flat entries when needed."""
+    url = _stream_url_from_info(entry)
+
+    # A search extractor can return a flat entry. Resolve its page to obtain
+    # the expiring CDN URL before returning it to the voice-chat player.
+    webpage_url = entry.get("webpage_url") or entry.get("original_url") or ""
+    if not url and webpage_url:
+        expanded = _extract_info_with_fallback(webpage_url)
+        if expanded:
+            url = _stream_url_from_info(expanded)
+            if url:
+                entry = expanded
+
     if not url:
         return None
 
     return TrackInfo(
         url=url,
-        title=info.get("title", query),
-        duration=_fmt_duration(info.get("duration") or 0),
-        thumbnail=info.get("thumbnail", ""),
+        title=entry.get("title", query),
+        duration=_fmt_duration(entry.get("duration") or 0),
+        thumbnail=entry.get("thumbnail", ""),
         source=source,
     )
+
+
+def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
+    """
+    Pull the first usable entry from a yt-dlp result dict and return it as
+    a TrackInfo.  Returns None when no playable URL is found.
+    """
+    entries = [e for e in (info.get("entries") or []) if e] if "entries" in info else [info]
+    for entry in entries:
+        track = _track_from_entry(entry, query, source)
+        if track:
+            return track
+    return None
 
 
 # ─── Stage 1: YouTube ─────────────────────────────────────────────────────────
@@ -654,6 +721,33 @@ def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo |
             logger.info("YouTube search: found %r for query %r", track["title"], q)
             return track
 
+    return None
+
+
+def search_soundcloud(query: str) -> "TrackInfo | None":
+    """
+    Search SoundCloud as a provider fallback.
+
+    SoundCloud is deliberately resolved through yt-dlp rather than scraping
+    HTML.  ``scsearch5`` returns multiple candidates; each candidate is
+    expanded and checked for a direct CDN URL, so one unavailable result does
+    not abort the whole search.
+    """
+    variants: list[str] = []
+    stripped = _strip_tashkeel(query)
+    for candidate in (query, stripped):
+        candidate = candidate.strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+
+    for candidate in variants:
+        info = _extract_info_with_fallback(f"scsearch5:{candidate}")
+        if not info:
+            continue
+        track = _extract_track(info, candidate, SOURCE_SOUNDCLOUD)
+        if track:
+            logger.info("SoundCloud search: found %r for query %r", track["title"], candidate)
+            return track
     return None
 
 
@@ -796,7 +890,9 @@ def get_audio_info(query: str) -> TrackInfo:
             )
 
         # Determine source tag from the URL before extracting.
-        if "anghami.com" in url:
+        if "soundcloud.com" in url:
+            tag = SOURCE_SOUNDCLOUD
+        elif "anghami.com" in url:
             tag = SOURCE_ANGHAMI
         elif "spotify.com" in url:
             tag = SOURCE_SPOTIFY
@@ -819,14 +915,22 @@ def get_audio_info(query: str) -> TrackInfo:
     if track:
         return track
 
-    # ── Stage 2: Spotify metadata → YouTube search ────────────────────────────
+    # ── Stage 2: SoundCloud fallback ──────────────────────────────────────────
+    # Unlike YouTube, SoundCloud does not depend on a JavaScript challenge
+    # solver. It is therefore the first independent provider to try when
+    # YouTube returns no playable entries.
+    track = search_soundcloud(query)
+    if track:
+        return track
+
+    # ── Stage 3: Spotify metadata → YouTube search ────────────────────────────
     refined_spotify = search_spotify(query)
     if refined_spotify:
         track = search_youtube(refined_spotify, SOURCE_SPOTIFY)
         if track:
             return track
 
-    # ── Stage 3: Anghami metadata → YouTube search ────────────────────────────
+    # ── Stage 4: Anghami metadata → YouTube search ────────────────────────────
     refined_anghami = search_anghami(query)
     if refined_anghami:
         track = search_youtube(refined_anghami, SOURCE_ANGHAMI)
