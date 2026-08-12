@@ -11,8 +11,11 @@ tgcrypto==1.2.5
 # Voice chat streaming — 2.x series
 py-tgcalls==2.2.11
 
-# Audio download / stream URL resolution (Updated to latest version to fix YouTube signature extraction)
+# Audio download / stream URL resolution
 yt-dlp>=2026.0.0
+
+# JavaScript interpreter for yt-dlp challenge solver
+js2py>=0.74
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
 spotipy==2.24.0
