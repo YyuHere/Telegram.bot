@@ -13,7 +13,7 @@ tgcrypto==1.2.5
 py-tgcalls==2.2.11
 
 # Audio download / stream URL resolution
-yt-dlp[default]>=2026.7.4
+yt-dlp==2024.12.23
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
 spotipy==2.24.0
