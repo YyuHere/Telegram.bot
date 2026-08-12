@@ -8,12 +8,11 @@ python-dotenv==1.0.1
 pyrogram==2.0.106
 tgcrypto==1.2.5
 
-# Voice chat streaming — 2.x series (0.9.7 was removed from PyPI)
-# AudioPiped import path: from pytgcalls.types import AudioPiped
+# Voice chat streaming — 2.x series
 py-tgcalls==2.2.11
 
-# Audio download / stream URL resolution
-yt-dlp==2024.12.23
+# Audio download / stream URL resolution (Updated to latest version to fix YouTube signature extraction)
+yt-dlp>=2026.0.0
 
 # Spotify Web API — used for metadata-guided YouTube search (Stage 2 fallback)
 spotipy==2.24.0
