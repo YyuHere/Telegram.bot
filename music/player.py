@@ -541,7 +541,8 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         "remote_components": ["ejs:github"],
         # Explicit default for local runs. _resolve_cookie_file() below
         # replaces this with the secure environment/mounted-file path when
-        # configured, and removes it when no local cookie file exists.
+        # configured. Keep this option even when the fallback file is absent
+        # so yt-dlp always receives an explicit cookiefile configuration.
         "cookiefile": "cookies.txt",
         "noplaylist": True,
         # Network hiccups and provider throttling should move to the next
@@ -569,15 +570,13 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
         },
     }
+    if extra:
+        opts.update(extra)
+    # Apply cookie configuration last so a supplied environment/mounted
+    # cookie source cannot be accidentally overwritten by caller options.
     cookie_file = _resolve_cookie_file()
     if cookie_file:
         opts["cookiefile"] = cookie_file
-    elif not _os.path.isfile("cookies.txt"):
-        # Do not make yt-dlp fail in environments that intentionally do not
-        # provide cookies (for example, clean CI or a first-time local run).
-        opts.pop("cookiefile", None)
-    if extra:
-        opts.update(extra)
     return opts
 
 
