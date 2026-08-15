@@ -539,6 +539,10 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # yt-dlp to fetch and cache that release when the bundled solver cannot
         # handle a newly rotated player script.
         "remote_components": ["ejs:github"],
+        # Explicit default for local runs. _resolve_cookie_file() below
+        # replaces this with the secure environment/mounted-file path when
+        # configured, and removes it when no local cookie file exists.
+        "cookiefile": "cookies.txt",
         "noplaylist": True,
         # Network hiccups and provider throttling should move to the next
         # client/provider instead of immediately surfacing "not found".
@@ -568,6 +572,10 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
     cookie_file = _resolve_cookie_file()
     if cookie_file:
         opts["cookiefile"] = cookie_file
+    elif not _os.path.isfile("cookies.txt"):
+        # Do not make yt-dlp fail in environments that intentionally do not
+        # provide cookies (for example, clean CI or a first-time local run).
+        opts.pop("cookiefile", None)
     if extra:
         opts.update(extra)
     return opts
