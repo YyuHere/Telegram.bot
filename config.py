@@ -30,6 +30,11 @@ ASSISTANT_ENABLED: bool = bool(API_ID and API_HASH and ASSISTANT_SESSION_STRING)
 SPOTIFY_CLIENT_ID: str     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
+# Optional yt-dlp authentication cookie jar. The default is the Git-ignored
+# root-level cookies.txt file for local/development use. Keep the cookie data
+# out of source control and set this to another mounted path in deployment.
+YTDLP_COOKIE_FILE: str = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
+
 # Bot admin user ID — the only user allowed to add replies via private DM.
 # Set BOT_ADMIN_ID in Replit Secrets (integer Telegram user ID).
 _admin_id_raw = os.environ.get("BOT_ADMIN_ID", "")

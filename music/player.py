@@ -13,6 +13,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import logging
+from pathlib import Path
 import shlex
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ from typing import TypedDict
 import yt_dlp
 
 from assistant.userbot import assistant
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -646,6 +648,16 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
     }
     if extra:
         opts.update(extra)
+
+    # Use the local/deployment-provided cookie jar for every yt-dlp operation
+    # (search, page expansion, and direct stream extraction) when available.
+    # The file is intentionally optional so the resolver remains cookie-free
+    # in environments that do not provide one.
+    cookie_file = Path(config.YTDLP_COOKIE_FILE).expanduser()
+    if cookie_file.is_file():
+        opts["cookiefile"] = str(cookie_file)
+        logger.debug("yt-dlp cookie file enabled: %s", cookie_file)
+
     return opts
 
 

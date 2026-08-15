@@ -56,11 +56,17 @@ Optional:
 - `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — optional Spotify text metadata search credentials; playback does not use Spotify cookies or a Spotify stream
 
-Music search is cookie-free. Song-name requests first search the
-YouTube Music catalog and extract a `music.youtube.com` stream. Standard
+Music search works without cookies by default. Song-name requests first search
+the YouTube Music catalog and extract a `music.youtube.com` stream. Standard
 YouTube is the next fallback, followed by SoundCloud and optional Spotify and
 Anghami metadata-guided searches. No browser cookies or restricted single-site
-URL is required.
+URL is required unless an optional cookie jar is provided.
+
+An optional local Netscape-format `cookies.txt` can be used to help yt-dlp
+avoid YouTube 403 responses. The file is Git-ignored and excluded from Docker
+images; for deployment, provide an equivalent secure mounted path through
+`YTDLP_COOKIE_FILE` rather than copying credentials into the image. Treat
+browser cookies like passwords and rotate them if they are ever exposed.
 
 ## Deployment
 
