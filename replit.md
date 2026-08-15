@@ -54,7 +54,12 @@ The assistant account used for voice chat streaming is fixed:
 
 Optional:
 - `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
-- `YTDLP_COOKIES_FILE` — path to a Netscape-format `cookies.txt` exported from a logged-in YouTube browser session; only needed if the Android client bypass is blocked on your server IP
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — optional Spotify text metadata search credentials; playback does not use Spotify cookies or a Spotify stream
+
+Music search is cookie-free. Song-name requests search YouTube and SoundCloud
+alongside optional Spotify and Anghami text indexes, then rank only playable
+public stream URLs by title similarity. No browser cookies or restricted
+single-site URL is required.
 
 ## Deployment
 

@@ -10,12 +10,14 @@ so the bot can manage multiple groups simultaneously.
 """
 
 import asyncio
+import concurrent.futures
 import inspect
 import logging
 import shlex
 import shutil
 import subprocess
 import unicodedata
+from difflib import SequenceMatcher
 from typing import TypedDict
 
 import yt_dlp
@@ -407,7 +409,6 @@ SOURCE_ANGHAMI = "anghami"  # Anghami metadata → YouTube stream
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 import re as _re
-import os as _os
 
 def _fmt_duration(secs: int) -> str:
     """Convert seconds to m:ss string."""
@@ -522,66 +523,6 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
-def _resolve_cookie_file() -> str | None:
-    """
-    Return a filesystem path to a Netscape-format cookies.txt for yt-dlp, or
-    None if no cookies are configured.
-
-    Two ways to supply cookies (checked in this order):
-
-      1. YTDLP_COOKIES_CONTENT — the *raw contents* of cookies.txt pasted
-         directly into a Railway/host environment variable.  This is the
-         recommended approach: it needs no file in the repo or a Railway
-         Volume, so the cookies (which are equivalent to a live login
-         session) never touch source control.  On each call the content is
-         written to a temp file once and the cached path is reused.
-
-      2. YTDLP_COOKIES_FILE — a path to an existing cookies.txt already
-         present on disk (for example, a private mounted file).
-
-      3. The project-root cookies.txt — supported for local development only.
-         This file is intentionally gitignored; production deployments should
-         use YTDLP_COOKIES_CONTENT or YTDLP_COOKIES_FILE instead.
-    """
-    global _cookie_file_cache
-
-    content = _os.environ.get("YTDLP_COOKIES_CONTENT", "").strip()
-    if content:
-        if _cookie_file_cache and _os.path.isfile(_cookie_file_cache):
-            return _cookie_file_cache
-        try:
-            import tempfile
-            fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
-            with _os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-                if not content.endswith("\n"):
-                    f.write("\n")
-            _cookie_file_cache = path
-            logger.info("yt-dlp cookies loaded from YTDLP_COOKIES_CONTENT (%s)", path)
-            return path
-        except Exception as exc:
-            logger.warning("Failed to materialize YTDLP_COOKIES_CONTENT to a temp file: %s", exc)
-
-    file_path = _os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if file_path and _os.path.isfile(file_path):
-        return file_path
-
-    # Local-only convenience path. Never create or populate this file here:
-    # callers must provide it outside source control.
-    root_cookie_file = _os.path.join(
-        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-        "cookies.txt",
-    )
-    if _os.path.isfile(root_cookie_file):
-        logger.info("yt-dlp cookies loaded from project-root cookies.txt")
-        return root_cookie_file
-
-    return None
-
-
-_cookie_file_cache: str | None = None
-
-
 # Client fallback order for the current (2026) SABR-enforcement landscape.
 # No single client is reliable for every video — YouTube's SABR rollout is
 # uneven per-video/per-region, and yt-dlp's own client support shifts often.
@@ -612,7 +553,7 @@ class _YtdlpDiagnosticLogger:
     logger instead of letting them vanish behind quiet=True/no_warnings=True.
 
     Those internal messages ("YouTube is forcing SABR streaming for this
-    client", "Some formats may be missing", PO Token complaints, cookie
+    client", "Some formats may be missing", PO Token complaints, access
     errors, etc.) are the ONLY place the *actual* reason a client failed
     shows up — the generic "Requested format is not available" exception
     string alone is not enough to tell SABR-block apart from a bad cookie,
@@ -676,11 +617,6 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # yt-dlp to fetch and cache that release when the bundled solver cannot
         # handle a newly rotated player script.
         "remote_components": ["ejs:github"],
-        # Explicit default for local runs. _resolve_cookie_file() below
-        # replaces this with the secure environment/mounted-file path when
-        # configured. Keep this option even when the fallback file is absent
-        # so yt-dlp always receives an explicit cookiefile configuration.
-        "cookiefile": "cookies.txt",
         "noplaylist": True,
         # Network hiccups and provider throttling should move to the next
         # client/provider instead of immediately surfacing "not found".
@@ -709,11 +645,6 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
     }
     if extra:
         opts.update(extra)
-    # Apply cookie configuration last so a supplied environment/mounted
-    # cookie source cannot be accidentally overwritten by caller options.
-    cookie_file = _resolve_cookie_file()
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
     return opts
 
 
@@ -772,6 +703,8 @@ def _search_track_with_client_fallback(
     that response as a successful extraction, but for searches we must inspect
     the batch and continue to the next client when no playable track exists.
     """
+    best: TrackInfo | None = None
+    best_score = -1.0
     for clients in _CLIENT_FALLBACK_CHAIN:
         opts = _ydl_opts(player_clients=clients)
         try:
@@ -785,15 +718,16 @@ def _search_track_with_client_fallback(
 
         if not info:
             continue
-        track = _extract_track(info, query, source)
-        if track:
-            return track
+        for track in _extract_tracks(info, query, source, limit=8):
+            score = _match_score(query, track)
+            if score > best_score:
+                best, best_score = track, score
         logger.debug(
-            "Search %r returned no playable entries with client(s) %s",
+            "Search %r returned no better playable entries with client(s) %s",
             query, clients,
         )
 
-    return None
+    return best
 
 
 def _stream_url_from_info(info: dict) -> str:
@@ -867,17 +801,67 @@ def _track_from_entry(entry: dict, query: str, source: str) -> "TrackInfo | None
     )
 
 
+def _title_tokens(value: str) -> set[str]:
+    """Return comparable words from Arabic or Latin song text."""
+    normalized = _strip_tashkeel(unicodedata.normalize("NFKC", value)).casefold()
+    normalized = _SEARCH_PUNCTUATION_RE.sub(" ", normalized)
+    return {token for token in normalized.split() if len(token) > 1}
+
+
+def _match_score(query: str, track: "TrackInfo") -> float:
+    """
+    Score how closely a playable result matches the requested song name.
+
+    Provider ordering is intentionally not part of this score. An exact
+    SoundCloud/Anghami result should beat a vague YouTube result, and the
+    same rule works for Arabic, transliterated Arabic, and Latin titles.
+    """
+    requested_tokens = _title_tokens(query)
+    title_tokens = _title_tokens(track["title"])
+    if not requested_tokens or not title_tokens:
+        return 0.0
+
+    requested = " ".join(sorted(requested_tokens))
+    title = " ".join(sorted(title_tokens))
+    sequence = SequenceMatcher(None, requested, title).ratio()
+    overlap = len(requested_tokens & title_tokens) / len(requested_tokens)
+
+    # Penalize common non-song uploads without rejecting them. This keeps an
+    # exact official audio ahead of a similarly named short, live, or remix.
+    lowered = track["title"].casefold()
+    quality_penalty = sum(
+        0.06 for marker in (
+            "short", "shorts", "clip", "teaser", "trailer", "live",
+            "remix", "sped up", "slowed", "cover", "karaoke",
+        ) if marker in lowered
+    )
+    return max(0.0, (sequence * 0.45) + (overlap * 0.55) - quality_penalty)
+
+
+def _extract_tracks(
+    info: dict,
+    query: str,
+    source: str,
+    limit: int = 8,
+) -> list["TrackInfo"]:
+    """Expand several search entries and retain only playable streams."""
+    entries = [e for e in (info.get("entries") or []) if e] if "entries" in info else [info]
+    tracks: list[TrackInfo] = []
+    seen: set[str] = set()
+    for entry in entries[:limit]:
+        track = _track_from_entry(entry, query, source)
+        if track and track["url"] not in seen:
+            seen.add(track["url"])
+            tracks.append(track)
+    return tracks
+
+
 def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
     """
-    Pull the first usable entry from a yt-dlp result dict and return it as
-    a TrackInfo.  Returns None when no playable URL is found.
+    Pull the best matching usable entry from a yt-dlp result dict.
     """
-    entries = [e for e in (info.get("entries") or []) if e] if "entries" in info else [info]
-    for entry in entries:
-        track = _track_from_entry(entry, query, source)
-        if track:
-            return track
-    return None
+    tracks = _extract_tracks(info, query, source, limit=8)
+    return max(tracks, key=lambda item: _match_score(query, item), default=None)
 
 
 # ─── Stage 1: YouTube ─────────────────────────────────────────────────────────
@@ -892,17 +876,19 @@ def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo |
     Returns None when all variants fail so the caller can fall through to the
     next source.  Never raises.
     """
+    best: TrackInfo | None = None
+    best_score = -1.0
     for q in _search_query_variants(query):
         track = _search_track_with_client_fallback(
             f"ytsearch{_SEARCH_RESULT_LIMIT}:{q}",
             q,
             source_tag,
         )
-        if track:
-            logger.info("YouTube search: found %r for query %r", track["title"], q)
-            return track
-
-    return None
+        if track and _match_score(query, track) > best_score:
+            best, best_score = track, _match_score(query, track)
+    if best:
+        logger.info("YouTube search: found %r for query %r", best["title"], query)
+    return best
 
 
 def search_soundcloud(query: str) -> "TrackInfo | None":
@@ -914,16 +900,19 @@ def search_soundcloud(query: str) -> "TrackInfo | None":
     expanded and checked for a direct CDN URL, so one unavailable result does
     not abort the whole search.
     """
+    best: TrackInfo | None = None
+    best_score = -1.0
     for candidate in _search_query_variants(query):
         track = _search_track_with_client_fallback(
             f"scsearch{_SEARCH_RESULT_LIMIT}:{candidate}",
             candidate,
             SOURCE_SOUNDCLOUD,
         )
-        if track:
-            logger.info("SoundCloud search: found %r for query %r", track["title"], candidate)
-            return track
-    return None
+        if track and _match_score(query, track) > best_score:
+            best, best_score = track, _match_score(query, track)
+    if best:
+        logger.info("SoundCloud search: found %r for query %r", best["title"], query)
+    return best
 
 
 def get_best_audio_url(url_or_id: str) -> "TrackInfo | None":
@@ -1035,20 +1024,79 @@ def search_anghami(query: str) -> "str | None":
     return None
 
 
+def _search_spotify_stream(query: str) -> "TrackInfo | None":
+    """Use Spotify's text index to improve the query, then stream elsewhere."""
+    refined = search_spotify(query)
+    return search_youtube(refined, SOURCE_SPOTIFY) if refined else None
+
+
+def _search_anghami_stream(query: str) -> "TrackInfo | None":
+    """Use Anghami's Arabic text index to improve the query, then stream elsewhere."""
+    refined = search_anghami(query)
+    return search_youtube(refined, SOURCE_ANGHAMI) if refined else None
+
+
+def _search_all_platforms(query: str) -> list["TrackInfo"]:
+    """
+    Search independent text indexes concurrently and return playable candidates.
+
+    No provider is treated as authoritative. Spotify and Anghami are metadata
+    indexes only; the actual stream is always resolved through a public,
+    yt-dlp-supported media result. This avoids depending on a login cookie,
+    private API session, or a restricted page from any one site.
+    """
+    searches = {
+        "youtube": search_youtube,
+        "soundcloud": search_soundcloud,
+        "spotify": _search_spotify_stream,
+        "anghami": _search_anghami_stream,
+    }
+    results: list[TrackInfo] = []
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(searches),
+        thread_name_prefix="music-search",
+    ) as executor:
+        futures = {
+            executor.submit(search, query): provider
+            for provider, search in searches.items()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            provider = futures[future]
+            try:
+                track = future.result()
+            except Exception as exc:
+                logger.warning("%s text search failed for %r: %s", provider, query, exc)
+                continue
+            if track:
+                logger.info(
+                    "Candidate from %s: %r (match=%.3f)",
+                    provider,
+                    track["title"],
+                    _match_score(query, track),
+                )
+                results.append(track)
+
+    return results
+
+
 # ─── Main resolution function ─────────────────────────────────────────────────
 
 def get_audio_info(query: str) -> TrackInfo:
     """
     Resolve *query* (song name or direct URL) to a playable audio stream.
 
-    Fallback chain
-    ──────────────
-    0. Direct URL      — YouTube/audio links are extracted immediately via yt-dlp.
+    Text search strategy
+    ─────────────────────
+    0. Direct URL      — supported as an explicit user request only.
     1. YouTube search  — ``ytsearch20`` with normalized query variants.
-    2. SoundCloud      — ``scsearch20`` independent provider fallback.
-    3. Spotify         — metadata lookup → refined YouTube search.
-    4. Anghami         — metadata lookup → refined YouTube search.
-                         (Strong for Arabic songs / mahraganat.)
+    2. SoundCloud      — ``scsearch20`` independent provider search.
+    3. Spotify         — optional metadata search → public stream search.
+    4. Anghami         — public metadata search → public stream search.
+
+    The four text searches run concurrently. Every playable candidate is
+    ranked against the original user query before one stream is selected.
+    yt-dlp never receives a cookie file.
 
     Raises RuntimeError with an Arabic message when every stage fails.
     """
@@ -1086,36 +1134,21 @@ def get_audio_info(query: str) -> TrackInfo:
             "تأكد من صحة الرابط أو أرسل رابط يوتيوب مباشرًا."
         )
 
-    # ── Stage 1: YouTube direct search ───────────────────────────────────────
-    track = search_youtube(query, SOURCE_YOUTUBE)
-    if track:
-        return track
-
-    # ── Stage 2: SoundCloud fallback ──────────────────────────────────────────
-    # Unlike YouTube, SoundCloud does not depend on a JavaScript challenge
-    # solver. It is therefore the first independent provider to try when
-    # YouTube returns no playable entries.
-    track = search_soundcloud(query)
-    if track:
-        return track
-
-    # ── Stage 3: Spotify metadata → YouTube search ────────────────────────────
-    refined_spotify = search_spotify(query)
-    if refined_spotify:
-        track = search_youtube(refined_spotify, SOURCE_SPOTIFY)
-        if track:
-            return track
-
-    # ── Stage 4: Anghami metadata → YouTube search ────────────────────────────
-    refined_anghami = search_anghami(query)
-    if refined_anghami:
-        track = search_youtube(refined_anghami, SOURCE_ANGHAMI)
-        if track:
-            return track
+    # ── Multi-platform text search ────────────────────────────────────────────
+    candidates = _search_all_platforms(query)
+    if candidates:
+        # Deduplicate equivalent CDN/page resolutions while retaining the
+        # highest-quality title match.
+        unique: dict[str, TrackInfo] = {}
+        for candidate in candidates:
+            current = unique.get(candidate["url"])
+            if current is None or _match_score(query, candidate) > _match_score(query, current):
+                unique[candidate["url"]] = candidate
+        return max(unique.values(), key=lambda item: _match_score(query, item))
 
     raise RuntimeError(
         "❌ لم يتم العثور على الأغنية في أي مصدر.\n"
-        "جرب اسمًا آخر أو أرسل رابط يوتيوب مباشرًا."
+        "جرب اسمًا آخر أو اكتب اسم الفنان مع الأغنية."
     )
 
 

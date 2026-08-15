@@ -208,8 +208,8 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as exc:
         logger.warning("Search failed for %r: %s", query, exc)
         await status.edit_text(
-            "❌ لم يتم العثور على الأغنية في YouTube أو SoundCloud.\n"
-            "جرب اسمًا آخر أو أرسل رابطًا مباشرًا."
+            "❌ لم يتم العثور على أغنية قابلة للتشغيل عبر مصادر البحث المتاحة.\n"
+            "جرب كتابة اسم الفنان مع الأغنية أو اسمًا آخر."
         )
         return
 
@@ -280,7 +280,7 @@ async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         track = await asyncio.to_thread(player.get_audio_info, query)
     except Exception as exc:
         logger.warning("yt-dlp (queue) failed for %r: %s", query, exc)
-        await status.edit_text(f"❌ لم يتم العثور على النتيجة: {exc}")
+        await status.edit_text(f"❌ لم يتم العثور على نتيجة قابلة للتشغيل: {exc}")
         return
 
     chat_id = msg.chat.id
