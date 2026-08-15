@@ -10,6 +10,7 @@ so the bot can manage multiple groups simultaneously.
 """
 
 import asyncio
+import inspect
 import logging
 import shlex
 import shutil
@@ -302,7 +303,12 @@ async def ensure_pytgcalls_started() -> None:
         await call_py.start()
         _pytgcalls_started = True
         logger.info("PyTgCalls client started successfully.")
-    except Exception:
+        if assistant is not None and not assistant.is_connected:
+            raise RuntimeError(
+                "PyTgCalls reported started, but the Pyrogram assistant is "
+                "not connected.",
+            )
+    except Exception as exc:
         # Use logger.exception() so the full stack trace is printed.
         # Common causes: session string expired/invalid, Pyrogram client not
         # yet connected, missing tgcalls native bindings, or version mismatch
@@ -312,6 +318,9 @@ async def ensure_pytgcalls_started() -> None:
             "unavailable. Check the ASSISTANT_SESSION_STRING secret and "
             "ensure pyrogram, pytgcalls, and tgcrypto are at compatible versions."
         )
+        raise RuntimeError(
+            "PyTgCalls could not start; the assistant cannot join voice chats.",
+        ) from exc
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
@@ -1494,6 +1503,85 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
 
 # ─── PyTgCalls API compatibility ──────────────────────────────────────────────
 
+async def _call_is_active(chat_id: int) -> bool | None:
+    """
+    Return whether PyTgCalls has registered an active call for *chat_id*.
+
+    PyTgCalls 2.x keeps this state in its ntgcalls binding. Older APIs do not
+    expose a stable public equivalent, so ``None`` means that the join method's
+    successful return is the only available confirmation for that version.
+    """
+    if call_py is None:
+        return False
+
+    binding = getattr(call_py, "_binding", None)
+    calls_method = getattr(binding, "calls", None)
+    if not callable(calls_method):
+        return None
+
+    calls = calls_method()
+    if inspect.isawaitable(calls):
+        calls = await calls
+    return chat_id in calls
+
+
+async def _wait_for_active_call(chat_id: int, timeout: float = 8.0) -> None:
+    """
+    Confirm that a successful join method actually registered the call.
+
+    The Telegram/ntgcalls connection completes asynchronously after the
+    method returns. A short poll avoids reporting "Started Streaming" while
+    the assistant has already disconnected or never registered the call.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    observed_binding = False
+
+    while asyncio.get_running_loop().time() < deadline:
+        active = await _call_is_active(chat_id)
+        if active is None:
+            logger.info(
+                "PyTgCalls join method returned for chat %s; "
+                "active-call introspection is unavailable on this API.",
+                chat_id,
+            )
+            return
+        observed_binding = True
+        if active:
+            logger.info("PyTgCalls reports an active call in chat %s.", chat_id)
+            return
+        await asyncio.sleep(0.25)
+
+    if observed_binding:
+        raise RuntimeError(
+            f"PyTgCalls join method returned, but no active call was registered "
+            f"for chat {chat_id} within {timeout:.0f}s.",
+        )
+
+
+async def _invoke_call_method(method, method_name: str, chat_id: int, stream) -> None:
+    """Invoke and await one PyTgCalls join method with explicit diagnostics."""
+    logger.info(
+        "Calling PyTgCalls.%s(chat_id=%s) to join/start the voice stream.",
+        method_name, chat_id,
+    )
+    try:
+        result = method(chat_id, stream)
+        if inspect.isawaitable(result):
+            await result
+        else:
+            logger.warning(
+                "PyTgCalls.%s returned a non-awaitable result; "
+                "the installed API may be incompatible.",
+                method_name,
+            )
+    except Exception:
+        logger.exception(
+            "PyTgCalls.%s failed while joining chat %s.",
+            method_name, chat_id,
+        )
+        raise
+
+
 async def _play_stream(chat_id: int, stream) -> None:
     """
     Start or join a stream using the installed PyTgCalls API.
@@ -1504,19 +1592,18 @@ async def _play_stream(chat_id: int, stream) -> None:
     """
     if call_py is None:
         raise RuntimeError("PyTgCalls is not initialized.")
-    method = getattr(call_py, "play", None)
-    if method is not None:
-        await method(chat_id, stream)
-        return
-    join_call = getattr(call_py, "join_call", None)
-    if join_call is not None:
-        await join_call(chat_id, stream)
-        return
-    legacy_method = getattr(call_py, "join_group_call", None)
-    if legacy_method is not None:
-        await legacy_method(chat_id, stream)
-        return
-    raise RuntimeError("Installed PyTgCalls has no supported stream-start method.")
+
+    for method_name in ("play", "join_call", "join_group_call"):
+        method = getattr(call_py, method_name, None)
+        if callable(method):
+            await _invoke_call_method(method, method_name, chat_id, stream)
+            await _wait_for_active_call(chat_id)
+            return
+
+    raise RuntimeError(
+        "Installed PyTgCalls has no supported stream-start method "
+        "(expected play, join_call, or join_group_call).",
+    )
 
 
 async def _change_stream(chat_id: int, stream) -> None:
@@ -1524,20 +1611,26 @@ async def _change_stream(chat_id: int, stream) -> None:
     if call_py is None:
         raise RuntimeError("PyTgCalls is not initialized.")
     method = getattr(call_py, "play", None)
-    if method is not None:
+    if callable(method):
         # In py-tgcalls 2.x, play() detects an existing call and swaps its
         # stream sources internally.
-        await method(chat_id, stream)
+        await _invoke_call_method(method, "play", chat_id, stream)
+        await _wait_for_active_call(chat_id)
         return
     legacy_method = getattr(call_py, "change_stream", None)
-    if legacy_method is not None:
-        await legacy_method(chat_id, stream)
+    if callable(legacy_method):
+        await _invoke_call_method(legacy_method, "change_stream", chat_id, stream)
+        await _wait_for_active_call(chat_id)
         return
     join_call = getattr(call_py, "join_call", None)
-    if join_call is not None:
-        await join_call(chat_id, stream)
+    if callable(join_call):
+        await _invoke_call_method(join_call, "join_call", chat_id, stream)
+        await _wait_for_active_call(chat_id)
         return
-    raise RuntimeError("Installed PyTgCalls has no supported stream-change method.")
+    raise RuntimeError(
+        "Installed PyTgCalls has no supported stream-change method "
+        "(expected play, change_stream, or join_call).",
+    )
 
 
 async def _leave_stream(chat_id: int) -> None:
