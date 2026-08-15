@@ -10,6 +10,9 @@ artifacts/
 # Environment
 .env
 
+# Keep local browser/session cookies out of deployed images.
+cookies.txt
+
 # Python bytecode
 __pycache__
 *.pyc

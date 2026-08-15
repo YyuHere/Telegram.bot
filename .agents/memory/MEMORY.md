@@ -1,1 +1,2 @@
 - [YouTube extractor client choice](youtube-extractor-client.md) — prefer android_vr before tv because tv can expose DRM-only results and misleading extraction warnings.
+- [Cookie handling](yt-dlp-cookie-handling.md) — never commit browser cookies; use ignored local files or secure environment injection.

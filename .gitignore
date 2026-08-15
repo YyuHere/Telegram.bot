@@ -48,3 +48,6 @@ Thumbs.db
 .cache/
 .local/
 .env
+
+# Never commit browser/session cookies or other yt-dlp authentication data.
+/cookies.txt

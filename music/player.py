@@ -400,8 +400,11 @@ def _resolve_cookie_file() -> str | None:
          written to a temp file once and the cached path is reused.
 
       2. YTDLP_COOKIES_FILE — a path to an existing cookies.txt already
-         present on disk (e.g. committed to the repo or mounted via a
-         Railway Volume).  Kept for backward compatibility.
+         present on disk (for example, a private mounted file).
+
+      3. The project-root cookies.txt — supported for local development only.
+         This file is intentionally gitignored; production deployments should
+         use YTDLP_COOKIES_CONTENT or YTDLP_COOKIES_FILE instead.
     """
     global _cookie_file_cache
 
@@ -425,6 +428,16 @@ def _resolve_cookie_file() -> str | None:
     file_path = _os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if file_path and _os.path.isfile(file_path):
         return file_path
+
+    # Local-only convenience path. Never create or populate this file here:
+    # callers must provide it outside source control.
+    root_cookie_file = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "cookies.txt",
+    )
+    if _os.path.isfile(root_cookie_file):
+        logger.info("yt-dlp cookies loaded from project-root cookies.txt")
+        return root_cookie_file
 
     return None
 
