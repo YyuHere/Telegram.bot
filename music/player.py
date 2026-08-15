@@ -11,6 +11,7 @@ so the bot can manage multiple groups simultaneously.
 
 import asyncio
 import logging
+import shlex
 import shutil
 import subprocess
 import unicodedata
@@ -57,7 +58,14 @@ def _make_stream(url: str):
     Build the pytgcalls stream object for *url* and return it.
     Delegates to _stream_builder which is resolved once at module load.
     """
-    return _stream_builder(url)
+    stream = _stream_builder(url)
+    if stream is None:
+        raise RuntimeError(
+            "No compatible PyTgCalls audio stream builder is available. "
+            "Install py-tgcalls with its ntgcalls dependency and ensure ffmpeg "
+            "is installed.",
+        )
+    return stream
 
 
 def _resolve_stream_builder():
@@ -71,11 +79,12 @@ def _resolve_stream_builder():
          Import path: pytgcalls.types.input_stream
          Pattern: AudioPiped(url, HighQualityAudio())
 
-      2. AudioPiped  — py-tgcalls 2.x (the version pinned in requirements.txt).
-         Import path: pytgcalls.types
-         Pattern: AudioPiped(url)
+      2. Raw shell-backed AudioStream — py-tgcalls 2.x (the version pinned in
+         requirements.txt). This explicitly makes FFmpeg emit stereo 48 kHz
+         signed 16-bit PCM to stdout, which ntgcalls consumes as microphone
+         audio.
 
-      3. MediaStream  — py-tgcalls ≥ 3.x / pytgcalls fork.
+      3. MediaStream — py-tgcalls 2.x fallback and newer forks.
          Import path: pytgcalls.types
          Pattern: MediaStream(url)
 
@@ -91,26 +100,77 @@ def _resolve_stream_builder():
     except ImportError:
         pass
 
-    # ── py-tgcalls 2.x  ──────────────────────────────────────────────────────
+    # ── py-tgcalls 2.x: explicit FFmpeg → raw PCM pipeline ──────────────────
     try:
-        from pytgcalls.types import AudioPiped as _AudioPiped2       # noqa: PLC0415
-        logger.info("pytgcalls stream API: AudioPiped (py-tgcalls 2.x)")
-        return lambda url: _AudioPiped2(url)
+        from ntgcalls import MediaSource                         # noqa: PLC0415
+        from pytgcalls.types.raw import AudioParameters            # noqa: PLC0415
+        from pytgcalls.types.raw import AudioStream                # noqa: PLC0415
+        from pytgcalls.types.raw import Stream                     # noqa: PLC0415
+
+        def _raw_audio_stream(url: str):
+            """
+            Return a raw stream whose input is an FFmpeg shell command.
+
+            PyTgCalls 2.x maps ``MediaSource.SHELL`` to an ntgcalls process
+            and reads the command's stdout. The output format must match the
+            AudioParameters exactly: signed little-endian 16-bit PCM, 48 kHz,
+            stereo.
+            """
+            audio = AudioParameters(bitrate=48000, channels=2)
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-nostdin",
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
+                "-i", url,
+                "-vn",
+                "-sn",
+                "-dn",
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-ar", str(audio.bitrate),
+                "-ac", str(audio.channels),
+                "pipe:1",
+            ]
+            return Stream(
+                microphone=AudioStream(
+                    MediaSource.SHELL,
+                    shlex.join(command),
+                    audio,
+                ),
+            )
+
+        logger.info(
+            "pytgcalls stream API: raw AudioStream via FFmpeg "
+            "(48 kHz stereo s16le PCM, py-tgcalls 2.x)",
+        )
+        return _raw_audio_stream
     except ImportError:
         pass
 
-    # ── py-tgcalls ≥ 3.x / newer forks  ──────────────────────────────────────
+    # ── MediaStream fallback for newer forks ──────────────────────────────────
     try:
         from pytgcalls.types import MediaStream                       # noqa: PLC0415
-        logger.info("pytgcalls stream API: MediaStream (py-tgcalls ≥ 3.x)")
-        return lambda url: MediaStream(url)
+        from pytgcalls.types import AudioQuality                       # noqa: PLC0415
+        logger.info("pytgcalls stream API: MediaStream (newer/forked API)")
+        return lambda url: MediaStream(
+            url,
+            audio_parameters=AudioQuality.HIGH,
+            audio_flags=MediaStream.Flags.REQUIRED,
+            video_flags=MediaStream.Flags.IGNORE,
+        )
     except ImportError:
         pass
 
     logger.error(
-        "pytgcalls stream API: could not import AudioPiped or MediaStream from "
-        "any known path. Installed py-tgcalls version may be incompatible. "
-        "Ensure py-tgcalls>=2.2.11,<3.0 and tgcrypto are installed correctly."
+        "pytgcalls stream API: could not import a raw AudioStream, AudioPiped, "
+        "or MediaStream from any known path. Installed py-tgcalls version may "
+        "be incompatible. Ensure py-tgcalls>=2.2.11,<3.0, ntgcalls, and "
+        "tgcrypto are installed correctly."
     )
     return lambda url: None
 
@@ -1287,7 +1347,8 @@ async def _create_voice_chat(chat_id: int) -> None:
     """
     Start a new Telegram Voice Chat in *chat_id* via phone.CreateGroupCall.
 
-    Called only when join_group_call has already failed because no call is
+    Called only when the supported join/play method has already failed because
+    no call is
     active — never proactively.  Requires the userbot to have the
     "Manage Voice Chats" (manage_call) admin permission.
 
@@ -1354,7 +1415,7 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
         invite link when the userbot is not a member.  Raises RuntimeError if
         every strategy fails.
 
-    Step 2 — join_group_call (reactive, not proactive)
+    Step 2 — play/join_call (reactive, not proactive)
         Try to join the call directly.  If a call is already running this
         succeeds immediately — no admin rights needed.  Creation is attempted
         *only* when join fails because no call is active:
@@ -1365,7 +1426,7 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
               Re-ensure membership, retry once.
         • No-active-call keyword (attempt 0)
               Call _create_voice_chat() [requires "Manage Voice Chats" admin],
-              then retry join_group_call once.
+              then retry the join method once.
         • Anything else / second-attempt failure
               Re-raise unchanged.
 
@@ -1415,12 +1476,12 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
                         chat_id, exc,
                     )
                     await _create_voice_chat(chat_id)
-                    continue  # retry join_group_call
+                    continue  # retry the join method
 
                 # ── Peer / membership issue — re-ensure once and retry ─────────
                 if any(kw in err for kw in _NOT_MEMBER_KEYWORDS):
                     logger.info(
-                        "join_group_call(%s) peer/membership error (%s) "
+                        "voice-call join method(%s) peer/membership error (%s) "
                         "— re-ensuring and retrying",
                         chat_id, exc,
                     )
@@ -1438,13 +1499,18 @@ async def _play_stream(chat_id: int, stream) -> None:
     Start or join a stream using the installed PyTgCalls API.
 
     py-tgcalls 2.x uses ``play`` for both joining a call and replacing the
-    current stream. Older releases exposed ``join_group_call`` instead.
+    current stream. Some intermediate releases exposed ``join_call`` and
+    older releases exposed ``join_group_call`` instead.
     """
     if call_py is None:
         raise RuntimeError("PyTgCalls is not initialized.")
     method = getattr(call_py, "play", None)
     if method is not None:
         await method(chat_id, stream)
+        return
+    join_call = getattr(call_py, "join_call", None)
+    if join_call is not None:
+        await join_call(chat_id, stream)
         return
     legacy_method = getattr(call_py, "join_group_call", None)
     if legacy_method is not None:
@@ -1466,6 +1532,10 @@ async def _change_stream(chat_id: int, stream) -> None:
     legacy_method = getattr(call_py, "change_stream", None)
     if legacy_method is not None:
         await legacy_method(chat_id, stream)
+        return
+    join_call = getattr(call_py, "join_call", None)
+    if join_call is not None:
+        await join_call(chat_id, stream)
         return
     raise RuntimeError("Installed PyTgCalls has no supported stream-change method.")
 
@@ -1552,11 +1622,11 @@ async def play(chat_id: int, track: TrackInfo) -> None:
         logger.info("Replaced stream with: %s in chat %s", track["title"], chat_id)
         return
 
+    stream = _make_stream(track["url"])
+    await _join_group_call_with_autocreate(chat_id, stream)
     state["current"] = track
     state["playing"] = True
     state["paused"] = False
-
-    await _join_group_call_with_autocreate(chat_id, _make_stream(track["url"]))
     logger.info("Started streaming: %s in chat %s", track["title"], chat_id)
 
 
