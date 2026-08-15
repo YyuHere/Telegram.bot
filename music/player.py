@@ -256,7 +256,7 @@ class TrackInfo(TypedDict):
     title: str
     duration: str       # "m:ss"
     thumbnail: str      # URL
-    source: str         # "youtube" | "spotify" | "anghami"
+    source: str         # "youtube_music" | "youtube" | "soundcloud" | "spotify" | "anghami"
 
 
 # ─── Per-chat state ───────────────────────────────────────────────────────────
@@ -401,6 +401,7 @@ def health_check() -> dict:
 # ─── Source constants ─────────────────────────────────────────────────────────
 
 SOURCE_YOUTUBE = "youtube"
+SOURCE_YOUTUBE_MUSIC = "youtube_music"
 SOURCE_SOUNDCLOUD = "soundcloud"
 SOURCE_SPOTIFY = "spotify"   # Spotify metadata → YouTube stream
 SOURCE_ANGHAMI = "anghami"  # Anghami metadata → YouTube stream
@@ -891,6 +892,88 @@ def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo |
     return best
 
 
+def search_youtube_music(query: str) -> "TrackInfo | None":
+    """
+    Search the public YouTube Music catalog and resolve a playable track.
+
+    ``ytmusicapi`` supplies song-focused results (rather than the broader
+    YouTube video index). Each result is then extracted through a
+    ``music.youtube.com`` URL so the primary source remains YouTube Music all
+    the way through stream resolution. If the catalog or every candidate
+    extraction fails, return ``None`` and let the caller use standard YouTube.
+
+    The API is intentionally created lazily and unauthenticated: song search
+    must not require a browser cookie, login session, or extra secret.
+    """
+    try:
+        from ytmusicapi import YTMusic
+
+        catalog = YTMusic()
+        # A few normalized variants improve Arabic/punctuation tolerance while
+        # avoiding the large number of extraction requests used by the broader
+        # provider searches.
+        variants = _search_query_variants(query)[:3]
+        results: list[dict] = []
+        seen_video_ids: set[str] = set()
+
+        for candidate_query in variants:
+            catalog_results = catalog.search(
+                candidate_query,
+                filter="songs",
+                limit=8,
+            )
+            for result in catalog_results or []:
+                video_id = result.get("videoId")
+                if video_id and video_id not in seen_video_ids:
+                    seen_video_ids.add(video_id)
+                    results.append(result)
+
+        if not results:
+            logger.info("YouTube Music search returned no songs for %r", query)
+            return None
+
+        # Try the closest catalog matches first. A failed/blocked result should
+        # not prevent the next song result from being extracted.
+        results.sort(
+            key=lambda result: _match_score(
+                query,
+                TrackInfo(
+                    url="",
+                    title=result.get("title") or query,
+                    duration=_fmt_duration(result.get("duration_seconds") or 0),
+                    thumbnail="",
+                    source=SOURCE_YOUTUBE_MUSIC,
+                ),
+            ),
+            reverse=True,
+        )
+
+        for result in results:
+            video_id = result["videoId"]
+            music_url = f"https://music.youtube.com/watch?v={video_id}"
+            info = _extract_info_with_fallback(music_url)
+            if info is None:
+                continue
+
+            track = _extract_track(info, query, SOURCE_YOUTUBE_MUSIC)
+            if track:
+                logger.info(
+                    "YouTube Music search: found %r for query %r",
+                    track["title"],
+                    query,
+                )
+                return track
+
+        logger.info(
+            "YouTube Music found songs but none were playable for %r",
+            query,
+        )
+    except Exception as exc:
+        logger.warning("YouTube Music search failed for %r: %s", query, exc)
+
+    return None
+
+
 def search_soundcloud(query: str) -> "TrackInfo | None":
     """
     Search SoundCloud as a provider fallback.
@@ -1036,17 +1119,18 @@ def _search_anghami_stream(query: str) -> "TrackInfo | None":
     return search_youtube(refined, SOURCE_ANGHAMI) if refined else None
 
 
-def _search_all_platforms(query: str) -> list["TrackInfo"]:
+def _search_secondary_platforms(query: str) -> list["TrackInfo"]:
     """
-    Search independent text indexes concurrently and return playable candidates.
+    Search non-YouTube secondary indexes concurrently and return playable
+    candidates.
 
-    No provider is treated as authoritative. Spotify and Anghami are metadata
-    indexes only; the actual stream is always resolved through a public,
-    yt-dlp-supported media result. This avoids depending on a login cookie,
-    private API session, or a restricted page from any one site.
+    YouTube Music and standard YouTube are resolved before this function is
+    called. Spotify and Anghami are metadata indexes only; the actual stream
+    is still resolved through a public, yt-dlp-supported media result. This
+    avoids depending on a login cookie, private API session, or a restricted
+    page from any one site.
     """
     searches = {
-        "youtube": search_youtube,
         "soundcloud": search_soundcloud,
         "spotify": _search_spotify_stream,
         "anghami": _search_anghami_stream,
@@ -1089,14 +1173,16 @@ def get_audio_info(query: str) -> TrackInfo:
     Text search strategy
     ─────────────────────
     0. Direct URL      — supported as an explicit user request only.
-    1. YouTube search  — ``ytsearch20`` with normalized query variants.
-    2. SoundCloud      — ``scsearch20`` independent provider search.
-    3. Spotify         — optional metadata search → public stream search.
-    4. Anghami         — public metadata search → public stream search.
+    1. YouTube Music   — song-focused catalog search and Music URL extraction.
+    2. YouTube         — standard ``ytsearch20`` fallback.
+    3. SoundCloud      — ``scsearch20`` independent provider search.
+    4. Spotify         — optional metadata search → public stream search.
+    5. Anghami         — public metadata search → public stream search.
 
-    The four text searches run concurrently. Every playable candidate is
-    ranked against the original user query before one stream is selected.
-    yt-dlp never receives a cookie file.
+    YouTube Music and standard YouTube are deliberately sequential so the
+    primary source always wins when it can provide a playable stream. The
+    remaining secondary searches run concurrently only after both YouTube
+    stages fail. yt-dlp never receives a cookie file.
 
     Raises RuntimeError with an Arabic message when every stage fails.
     """
@@ -1120,6 +1206,8 @@ def get_audio_info(query: str) -> TrackInfo:
             tag = SOURCE_ANGHAMI
         elif "spotify.com" in url:
             tag = SOURCE_SPOTIFY
+        elif "music.youtube.com" in url:
+            tag = SOURCE_YOUTUBE_MUSIC
         else:
             tag = SOURCE_YOUTUBE
 
@@ -1134,8 +1222,20 @@ def get_audio_info(query: str) -> TrackInfo:
             "تأكد من صحة الرابط أو أرسل رابط يوتيوب مباشرًا."
         )
 
-    # ── Multi-platform text search ────────────────────────────────────────────
-    candidates = _search_all_platforms(query)
+    # ── YouTube Music is the primary text search and stream source ─────────────
+    # Keep this before all other providers. A playable Music result must not be
+    # displaced by a higher-scoring result from standard YouTube or SoundCloud.
+    youtube_music_track = search_youtube_music(query)
+    if youtube_music_track:
+        return youtube_music_track
+
+    # ── Standard YouTube is the first fallback ─────────────────────────────────
+    youtube_track = search_youtube(query)
+    if youtube_track:
+        return youtube_track
+
+    # ── Remaining provider fallbacks ───────────────────────────────────────────
+    candidates = _search_secondary_platforms(query)
     if candidates:
         # Deduplicate equivalent CDN/page resolutions while retaining the
         # highest-quality title match.

@@ -22,3 +22,6 @@ spotipy==2.24.0
 
 # HTTP client — used for Anghami search API (Stage 3 fallback)
 requests>=2.32.2,<3
+
+# Unauthenticated YouTube Music catalog search (primary music source)
+ytmusicapi>=1.12.2,<2

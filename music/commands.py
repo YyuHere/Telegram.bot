@@ -5,8 +5,9 @@ Triggers:
   • /play <query>  — slash command
   • تشغيل <query> — Arabic text trigger
 
-Search: YouTube first, then SoundCloud and metadata-guided fallbacks. Direct
-        audio URLs and other yt-dlp-supported platform links are also accepted.
+Search: YouTube Music first, then standard YouTube, SoundCloud, and
+         metadata-guided fallbacks. Direct audio URLs and other yt-dlp-supported
+         platform links are also accepted.
 Response: Thumbnail photo + formatted caption + inline playback keyboard.
 Callbacks: ▶️ ⏸️ 🔄 ⏭️ ⏹️ buttons wired to PyTgCalls controls.
 """
@@ -215,6 +216,7 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # ── Show source-specific progress message ─────────────────────────────────
     _source_msgs = {
+        player.SOURCE_YOUTUBE_MUSIC: "🎵 جاري التشغيل من YouTube Music...",
         player.SOURCE_YOUTUBE: "🎵 جاري التشغيل من YouTube...",
         player.SOURCE_SOUNDCLOUD: "☁️ جاري التشغيل من SoundCloud...",
         player.SOURCE_SPOTIFY: "🎧 تم العثور عبر Spotify، جاري التشغيل...",

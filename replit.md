@@ -5,7 +5,7 @@ A production-ready Telegram group management bot with a companion Pyrogram userb
 ## Stack
 - **python-telegram-bot v21** — main bot (async polling)
 - **Pyrogram** — assistant userbot for full member enumeration
-- **pytgcalls + yt-dlp** — voice chat music streaming (placeholder, coming soon)
+- **pytgcalls + yt-dlp + ytmusicapi** — voice chat music streaming
 - **SQLite** — local member and auto-reply store
 
 ## Project Structure
@@ -56,10 +56,11 @@ Optional:
 - `BOT_ADMIN_ID` — Telegram user ID allowed to add global auto-replies via DM
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — optional Spotify text metadata search credentials; playback does not use Spotify cookies or a Spotify stream
 
-Music search is cookie-free. Song-name requests search YouTube and SoundCloud
-alongside optional Spotify and Anghami text indexes, then rank only playable
-public stream URLs by title similarity. No browser cookies or restricted
-single-site URL is required.
+Music search is cookie-free. Song-name requests first search the
+YouTube Music catalog and extract a `music.youtube.com` stream. Standard
+YouTube is the next fallback, followed by SoundCloud and optional Spotify and
+Anghami metadata-guided searches. No browser cookies or restricted single-site
+URL is required.
 
 ## Deployment
 
