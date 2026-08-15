@@ -1,0 +1,1 @@
+- [YouTube extractor client choice](youtube-extractor-client.md) — prefer android_vr before tv because tv can expose DRM-only results and misleading extraction warnings.

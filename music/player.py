@@ -434,20 +434,20 @@ _cookie_file_cache: str | None = None
 
 # Client fallback order for the current (2026) SABR-enforcement landscape.
 # No single client is reliable for every video — YouTube's SABR rollout is
-# uneven per-video/per-region, and yt-dlp's own client support shifts often
-# (e.g. "tv_embedded" was removed as broken in Jan 2026). So instead of
-# betting on one client, try several in order and only give up once all of
-# them return zero usable formats:
-#   1. tv         — no PO Token needed; usually exposes itag 18 (360p muxed).
-#   2. android_vr — yt-dlp's own current default fallback; often still gets
-#                   a full adaptiveFormats list without a PO Token.
-#   3. android    — occasionally succeeds where the above don't.
-#   4. mweb       — mobile web; sometimes exposes formats "web" no longer does.
+# uneven per-video/per-region, and yt-dlp's own client support shifts often.
+# android_vr is preferred because it currently avoids the tv client's DRM path.
+# The remaining clients are tried in order when it returns no playable media:
+#   1. android_vr — usually exposes a full adaptiveFormats list without a
+#                   PO Token.
+#   2. android    — occasionally succeeds where the above doesn't.
+#   3. mweb       — mobile web; sometimes exposes formats other clients don't.
+# "tv" is intentionally excluded: it can return a non-empty result containing
+# only DRM-protected entries, which looks like a successful search but cannot
+# be handed to ffmpeg.
 # "web" and "ios" are deliberately NOT in this list: web is SABR-blocked and
 # ios needs a PO Token, so both fail immediately in most environments and
 # just waste a network round-trip before falling through.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
-    ("tv",),
     ("android_vr",),
     ("android",),
     ("mweb",),
@@ -521,6 +521,11 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # signature/n-parameter challenges silently fail on every client,
         # which is what was happening. https://github.com/yt-dlp/yt-dlp/wiki/EJS
         "js_runtimes": {"node": {}},
+        # yt-dlp's Python package includes the solver core, but the current
+        # YouTube player can require a matching external EJS release. Allow
+        # yt-dlp to fetch and cache that release when the bundled solver cannot
+        # handle a newly rotated player script.
+        "remote_components": ["ejs:github"],
         "noplaylist": True,
         # Network hiccups and provider throttling should move to the next
         # client/provider instead of immediately surfacing "not found".
