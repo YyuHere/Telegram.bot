@@ -13,6 +13,7 @@ import asyncio
 import logging
 import shutil
 import subprocess
+import unicodedata
 from typing import TypedDict
 
 import yt_dlp
@@ -360,6 +361,73 @@ def _strip_tashkeel(text: str) -> str:
     return _TASHKEEL_RE.sub("", text).strip()
 
 
+# Keep provider searches broad enough to find regional releases and alternate
+# spellings.  The old hard-coded ``5`` made a valid result disappear whenever
+# the first few YouTube/SoundCloud hits were remixes, clips, or unavailable.
+_SEARCH_RESULT_LIMIT = 20
+_SEARCH_PUNCTUATION_RE = _re.compile(r"[^\w\s\u0600-\u06FF]+", _re.UNICODE)
+
+
+def _search_query_variants(query: str) -> list[str]:
+    """
+    Build a small, deterministic set of tolerant search queries.
+
+    Search engines already handle some fuzzy matching, but punctuation,
+    full-width characters, Arabic tashkeel, and long metadata suffixes can
+    push the useful result out of the first page.  Keep the original query
+    first, then progressively normalize it and finally add provider-friendly
+    suffixes.  Duplicates are removed while preserving order.
+    """
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        value = " ".join(value.split()).strip()
+        if value and value.casefold() not in seen:
+            seen.add(value.casefold())
+            variants.append(value)
+
+    original = query.strip()
+    normalized = unicodedata.normalize("NFKC", original)
+    stripped = _strip_tashkeel(normalized)
+    # Remove bracketed release notes before punctuation normalization, since
+    # the latter would otherwise erase the brackets and make the boundaries
+    # impossible to detect.
+    without_release_notes = _re.sub(
+        r"\s*[\(\[\{][^)\]\}]*[\)\]\}]",
+        " ",
+        stripped,
+    )
+    punctuation_free = _SEARCH_PUNCTUATION_RE.sub(" ", stripped)
+    punctuation_free = " ".join(punctuation_free.split())
+
+    _add(original)
+    _add(normalized)
+    _add(stripped)
+    _add(punctuation_free)
+
+    # Also search without parenthesized/bracketed release notes such as
+    # "(official video)" or "[نسخة كاملة]".
+    clean_punctuation_free = _SEARCH_PUNCTUATION_RE.sub(" ", without_release_notes)
+    clean_punctuation_free = " ".join(clean_punctuation_free.split())
+    _add(clean_punctuation_free)
+
+    words = clean_punctuation_free.split()
+    if len(words) > 6:
+        _add(" ".join(words[:6]))
+    if len(words) > 4:
+        _add(" ".join(words[:4]))
+
+    # These are deliberately last: they help YouTube/SoundCloud rank a full
+    # song over short clips without replacing the user's exact query.
+    base = clean_punctuation_free or punctuation_free or stripped
+    if base:
+        _add(f"{base} audio")
+        _add(f"{base} song")
+
+    return variants
+
+
 _PLATFORM_HOSTS = (
     "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
     "music.youtube.com",
@@ -622,6 +690,43 @@ def _extract_info_with_fallback(target: str, extra: dict | None = None) -> dict 
     return None
 
 
+def _search_track_with_client_fallback(
+    target: str,
+    query: str,
+    source: str,
+) -> "TrackInfo | None":
+    """
+    Search one provider across all configured YouTube clients.
+
+    A search response can be non-empty yet contain only flat, unavailable, or
+    DRM-only entries.  ``_extract_info_with_fallback`` quite correctly treats
+    that response as a successful extraction, but for searches we must inspect
+    the batch and continue to the next client when no playable track exists.
+    """
+    for clients in _CLIENT_FALLBACK_CHAIN:
+        opts = _ydl_opts(player_clients=clients)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+        except Exception as exc:
+            logger.debug(
+                "Search %r failed with client(s) %s: %s", query, clients, exc,
+            )
+            continue
+
+        if not info:
+            continue
+        track = _extract_track(info, query, source)
+        if track:
+            return track
+        logger.debug(
+            "Search %r returned no playable entries with client(s) %s",
+            query, clients,
+        )
+
+    return None
+
+
 def _stream_url_from_info(info: dict) -> str:
     """
     Return a direct media URL from a yt-dlp info dict.
@@ -710,38 +815,20 @@ def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "Tra
 
 def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
     """
-    Search YouTube for *query* via ``ytsearch5`` and return the best result.
+    Search YouTube for *query* via ``ytsearch20`` and return the best result.
 
-    Tries variants in order to maximise Arabic hit-rate:
-      1. Original query
-      2. Tashkeel-stripped query (when different)
-      3. First 4 words (for long titles)
+    Tries exact and progressively normalized variants to tolerate Arabic
+    tashkeel, special characters, long release names, and minor misspellings.
 
     Returns None when all variants fail so the caller can fall through to the
     next source.  Never raises.
     """
-    variants: list[str] = []
-    seen: set[str] = set()
-
-    def _add(q: str) -> None:
-        k = q.strip()
-        if k and k not in seen:
-            seen.add(k)
-            variants.append(k)
-
-    _add(query)
-    stripped = _strip_tashkeel(query)
-    if stripped != query:
-        _add(stripped)
-    words = query.split()
-    if len(words) > 4:
-        _add(" ".join(words[:4]))
-
-    for q in variants:
-        info = _extract_info_with_fallback(f"ytsearch5:{q}")
-        if info is None:
-            continue
-        track = _extract_track(info, q, source_tag)
+    for q in _search_query_variants(query):
+        track = _search_track_with_client_fallback(
+            f"ytsearch{_SEARCH_RESULT_LIMIT}:{q}",
+            q,
+            source_tag,
+        )
         if track:
             logger.info("YouTube search: found %r for query %r", track["title"], q)
             return track
@@ -754,22 +841,16 @@ def search_soundcloud(query: str) -> "TrackInfo | None":
     Search SoundCloud as a provider fallback.
 
     SoundCloud is deliberately resolved through yt-dlp rather than scraping
-    HTML.  ``scsearch5`` returns multiple candidates; each candidate is
+    HTML.  ``scsearch20`` returns multiple candidates; each candidate is
     expanded and checked for a direct CDN URL, so one unavailable result does
     not abort the whole search.
     """
-    variants: list[str] = []
-    stripped = _strip_tashkeel(query)
-    for candidate in (query, stripped):
-        candidate = candidate.strip()
-        if candidate and candidate not in variants:
-            variants.append(candidate)
-
-    for candidate in variants:
-        info = _extract_info_with_fallback(f"scsearch5:{candidate}")
-        if not info:
-            continue
-        track = _extract_track(info, candidate, SOURCE_SOUNDCLOUD)
+    for candidate in _search_query_variants(query):
+        track = _search_track_with_client_fallback(
+            f"scsearch{_SEARCH_RESULT_LIMIT}:{candidate}",
+            candidate,
+            SOURCE_SOUNDCLOUD,
+        )
         if track:
             logger.info("SoundCloud search: found %r for query %r", track["title"], candidate)
             return track
@@ -894,9 +975,10 @@ def get_audio_info(query: str) -> TrackInfo:
     Fallback chain
     ──────────────
     0. Direct URL      — YouTube/audio links are extracted immediately via yt-dlp.
-    1. YouTube search  — ``ytsearch5`` with Arabic tashkeel support.
-    2. Spotify         — metadata lookup → refined YouTube search.
-    3. Anghami         — metadata lookup → refined YouTube search.
+    1. YouTube search  — ``ytsearch20`` with normalized query variants.
+    2. SoundCloud      — ``scsearch20`` independent provider fallback.
+    3. Spotify         — metadata lookup → refined YouTube search.
+    4. Anghami         — metadata lookup → refined YouTube search.
                          (Strong for Arabic songs / mahraganat.)
 
     Raises RuntimeError with an Arabic message when every stage fails.
