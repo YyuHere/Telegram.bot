@@ -1306,7 +1306,7 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
     # ── Step 2: join the call reactively ─────────────────────────────────────
     for attempt in range(2):
         try:
-            await call_py.join_group_call(chat_id, stream)
+            await _play_stream(chat_id, stream)
             logger.info(
                 "Joined voice call in chat %s (attempt %d)", chat_id, attempt + 1,
             )
@@ -1320,7 +1320,7 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
                     "Already in voice call for chat %s — switching stream",
                     chat_id,
                 )
-                await call_py.change_stream(chat_id, stream)
+                await _change_stream(chat_id, stream)
                 return
 
             if attempt == 0:
@@ -1347,6 +1347,75 @@ async def _join_group_call_with_autocreate(chat_id: int, stream) -> None:
 
             # Unrelated error, or second attempt also failed — surface it.
             raise
+
+
+# ─── PyTgCalls API compatibility ──────────────────────────────────────────────
+
+async def _play_stream(chat_id: int, stream) -> None:
+    """
+    Start or join a stream using the installed PyTgCalls API.
+
+    py-tgcalls 2.x uses ``play`` for both joining a call and replacing the
+    current stream. Older releases exposed ``join_group_call`` instead.
+    """
+    if call_py is None:
+        raise RuntimeError("PyTgCalls is not initialized.")
+    method = getattr(call_py, "play", None)
+    if method is not None:
+        await method(chat_id, stream)
+        return
+    legacy_method = getattr(call_py, "join_group_call", None)
+    if legacy_method is not None:
+        await legacy_method(chat_id, stream)
+        return
+    raise RuntimeError("Installed PyTgCalls has no supported stream-start method.")
+
+
+async def _change_stream(chat_id: int, stream) -> None:
+    """Replace the current stream across PyTgCalls API generations."""
+    if call_py is None:
+        raise RuntimeError("PyTgCalls is not initialized.")
+    method = getattr(call_py, "play", None)
+    if method is not None:
+        # In py-tgcalls 2.x, play() detects an existing call and swaps its
+        # stream sources internally.
+        await method(chat_id, stream)
+        return
+    legacy_method = getattr(call_py, "change_stream", None)
+    if legacy_method is not None:
+        await legacy_method(chat_id, stream)
+        return
+    raise RuntimeError("Installed PyTgCalls has no supported stream-change method.")
+
+
+async def _leave_stream(chat_id: int) -> None:
+    """Leave a voice call across PyTgCalls API generations."""
+    if call_py is None:
+        return
+    method = getattr(call_py, "leave_call", None) or getattr(call_py, "leave_group_call", None)
+    if method is None:
+        raise RuntimeError("Installed PyTgCalls has no supported leave method.")
+    await method(chat_id)
+
+
+async def _pause_stream(chat_id: int) -> None:
+    """Pause a voice call across PyTgCalls API generations."""
+    if call_py is None:
+        return
+    method = getattr(call_py, "pause", None) or getattr(call_py, "pause_stream", None)
+    if method is None:
+        raise RuntimeError("Installed PyTgCalls has no supported pause method.")
+    await method(chat_id)
+
+
+async def _resume_stream(chat_id: int) -> None:
+    """Resume a voice call across PyTgCalls API generations."""
+    if call_py is None:
+        return
+    method = getattr(call_py, "resume", None) or getattr(call_py, "resume_stream", None)
+    if method is None:
+        raise RuntimeError("Installed PyTgCalls has no supported resume method.")
+    await method(chat_id)
 
 
 # ─── Playback control ─────────────────────────────────────────────────────────
@@ -1397,7 +1466,7 @@ async def play(chat_id: int, track: TrackInfo) -> None:
         state["queue"].clear()
         state["current"] = track
         state["paused"] = False
-        await call_py.change_stream(chat_id, _make_stream(track["url"]))
+        await _change_stream(chat_id, _make_stream(track["url"]))
         logger.info("Replaced stream with: %s in chat %s", track["title"], chat_id)
         return
 
@@ -1440,16 +1509,16 @@ async def stop(chat_id: int) -> None:
     state["current"] = None
     if call_py is not None:
         try:
-            await call_py.leave_group_call(chat_id)
+            await _leave_stream(chat_id)
         except Exception as exc:
-            logger.warning("stop: leave_group_call raised %s", exc)
+            logger.warning("stop: leave call raised %s", exc)
 
 
 async def pause(chat_id: int) -> None:
     """Pause the current stream."""
     state = _get_state(chat_id)
     if call_py is not None and state["playing"] and not state["paused"]:
-        await call_py.pause_stream(chat_id)
+        await _pause_stream(chat_id)
         state["paused"] = True
 
 
@@ -1457,7 +1526,7 @@ async def resume(chat_id: int) -> None:
     """Resume a paused stream."""
     state = _get_state(chat_id)
     if call_py is not None and state["playing"] and state["paused"]:
-        await call_py.resume_stream(chat_id)
+        await _resume_stream(chat_id)
         state["paused"] = False
 
 
@@ -1478,7 +1547,7 @@ async def skip(chat_id: int) -> TrackInfo | None:
     state["paused"] = False
 
     if call_py is not None:
-        await call_py.change_stream(
+        await _change_stream(
             chat_id,
             _make_stream(next_track["url"]),
         )
@@ -1544,7 +1613,7 @@ if call_py is not None:
             track = state["current"]
             logger.info("Repeating: %s in chat %s", track["title"], chat_id)
             try:
-                await call_py.change_stream(
+                await _change_stream(
                     chat_id,
                     _make_stream(track["url"]),
                 )
@@ -1559,7 +1628,7 @@ if call_py is not None:
             state["paused"] = False
             logger.info("Auto-playing next: %s in chat %s", next_track["title"], chat_id)
             try:
-                await call_py.change_stream(
+                await _change_stream(
                     chat_id,
                     _make_stream(next_track["url"]),
                 )
@@ -1573,6 +1642,6 @@ if call_py is not None:
         state["paused"] = False
         state["current"] = None
         try:
-            await call_py.leave_group_call(chat_id)
+            await _leave_stream(chat_id)
         except Exception as exc:
             logger.warning("on_stream_end leave: %s", exc)
