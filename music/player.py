@@ -437,7 +437,12 @@ def _strip_tashkeel(text: str) -> str:
 # Keep provider searches broad enough to find regional releases and alternate
 # spellings.  The old hard-coded ``5`` made a valid result disappear whenever
 # the first few YouTube/SoundCloud hits were remixes, clips, or unavailable.
-_SEARCH_RESULT_LIMIT = 20
+# Search only a small candidate set. The resolver now extracts one selected
+# result instead of expanding every search entry, so a large result page only
+# adds throttling without improving playback quality.
+_SEARCH_RESULT_LIMIT = 5
+_SEARCH_VARIANT_LIMIT = 1
+_YOUTUBE_MUSIC_RESULT_LIMIT = 3
 _SEARCH_PUNCTUATION_RE = _re.compile(r"[^\w\s\u0600-\u06FF]+", _re.UNICODE)
 
 
@@ -585,7 +590,20 @@ class _YtdlpDiagnosticLogger:
         logger.warning("yt-dlp[%s] ERROR: %s", self._client_label, msg)
 
 
-def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv",)) -> dict:
+def _retry_delay(attempt: int) -> float:
+    """Return an exponentially increasing delay for failed yt-dlp requests."""
+    return min(
+        config.YTDLP_RETRY_DELAY * (2 ** max(0, attempt - 1)),
+        60.0,
+    )
+
+
+def _ydl_opts(
+    extra: dict | None = None,
+    player_clients: tuple[str, ...] = ("tv",),
+    *,
+    use_cookies: bool = False,
+) -> dict:
     """
     Build yt-dlp options with realistic browser headers and a YouTube player
     client that survives SABR-only enforcement.
@@ -621,18 +639,30 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
         # handle a newly rotated player script.
         "remote_components": ["ejs:github"],
         "noplaylist": True,
-        # Network hiccups and provider throttling should move to the next
-        # client/provider instead of immediately surfacing "not found".
-        "retries": 2,
-        "fragment_retries": 2,
-        "extractor_retries": 2,
+        # Keep retries limited and spaced out. A rapid retry burst makes a
+        # provider-side 429 worse and can extend the cooldown window.
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+        "retry_sleep_functions": {
+            "http": _retry_delay,
+            "fragment": _retry_delay,
+            "extractor": _retry_delay,
+            "file_access": _retry_delay,
+        },
+        "sleep_interval_requests": config.YTDLP_REQUEST_DELAY,
         "socket_timeout": 15,
-        # ytsearchN returns up to N results as a "playlist". Without this,
-        # a single unplayable result anywhere in that batch (no formats on
-        # any client, region-locked, age-gated, etc.) raises immediately and
-        # aborts the WHOLE search — even though other results might play
-        # fine. "only_download" skips just the broken entry and continues,
-        # so _extract_track can fall through to the next usable one.
+        # Search calls are metadata-only. The selected page is resolved in a
+        # separate authenticated call, so yt-dlp never expands every result
+        # just to inspect its formats.
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "getcomments": False,
+        "writeannotations": False,
         "ignoreerrors": "only_download",
         "extractor_args": {
             "youtube": {"player_client": list(player_clients)},
@@ -649,19 +679,23 @@ def _ydl_opts(extra: dict | None = None, player_clients: tuple[str, ...] = ("tv"
     if extra:
         opts.update(extra)
 
-    # Use the local/deployment-provided cookie jar for every yt-dlp operation
-    # (search, page expansion, and direct stream extraction) when available.
-    # The file is intentionally optional so the resolver remains cookie-free
-    # in environments that do not provide one.
+    # Cookies are for authenticated page/stream resolution only. Metadata
+    # searches intentionally omit the jar to avoid sending account cookies to
+    # provider search endpoints and to keep catalog scans lightweight.
     cookie_file = Path(config.YTDLP_COOKIE_FILE).expanduser()
-    if cookie_file.is_file():
+    if use_cookies and cookie_file.is_file():
         opts["cookiefile"] = str(cookie_file)
         logger.debug("yt-dlp cookie file enabled: %s", cookie_file)
 
     return opts
 
 
-def _extract_info_with_fallback(target: str, extra: dict | None = None) -> dict | None:
+def _extract_info_with_fallback(
+    target: str,
+    extra: dict | None = None,
+    *,
+    use_cookies: bool = True,
+) -> dict | None:
     """
     Run yt_dlp.extract_info(target) trying each client in
     _CLIENT_FALLBACK_CHAIN in order, returning the first successful result.
@@ -673,7 +707,11 @@ def _extract_info_with_fallback(target: str, extra: dict | None = None) -> dict 
     """
     last_exc: Exception | None = None
     for clients in _CLIENT_FALLBACK_CHAIN:
-        opts = _ydl_opts(extra, player_clients=clients)
+        opts = _ydl_opts(
+            extra,
+            player_clients=clients,
+            use_cookies=use_cookies,
+        )
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = ydl.extract_info(target, download=False)
@@ -709,17 +747,18 @@ def _search_track_with_client_fallback(
     source: str,
 ) -> "TrackInfo | None":
     """
-    Search one provider across all configured YouTube clients.
+    Search metadata without cookies, then resolve only the best candidate.
 
-    A search response can be non-empty yet contain only flat, unavailable, or
-    DRM-only entries.  ``_extract_info_with_fallback`` quite correctly treats
-    that response as a successful extraction, but for searches we must inspect
-    the batch and continue to the next client when no playable track exists.
+    The old implementation expanded up to eight entries for every client and
+    query variant. That multiplies page/format requests and is a common cause
+    of HTTP 429 responses. Search results are now flat metadata; only the
+    selected page receives the authenticated extraction call.
     """
-    best: TrackInfo | None = None
-    best_score = -1.0
     for clients in _CLIENT_FALLBACK_CHAIN:
-        opts = _ydl_opts(player_clients=clients)
+        opts = _ydl_opts(
+            player_clients=clients,
+            use_cookies=False,
+        )
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(target, download=False)
@@ -731,16 +770,28 @@ def _search_track_with_client_fallback(
 
         if not info:
             continue
-        for track in _extract_tracks(info, query, source, limit=8):
-            score = _match_score(query, track)
-            if score > best_score:
-                best, best_score = track, score
-        logger.debug(
-            "Search %r returned no better playable entries with client(s) %s",
-            query, clients,
+
+        metadata_entries = [
+            entry
+            for entry in (info.get("entries") or [])
+            if entry
+        ] if "entries" in info else [info]
+        metadata_tracks = [
+            track
+            for entry in metadata_entries[:_SEARCH_RESULT_LIMIT]
+            if (track := _metadata_track_from_entry(entry, query, source))
+        ]
+        metadata_tracks.sort(
+            key=lambda track: _match_score(query, track),
+            reverse=True,
         )
 
-    return best
+        for candidate in metadata_tracks[:2]:
+            resolved = _resolve_metadata_track(candidate, query)
+            if resolved:
+                return resolved
+
+    return None
 
 
 def _stream_url_from_info(info: dict) -> str:
@@ -814,6 +865,43 @@ def _track_from_entry(entry: dict, query: str, source: str) -> "TrackInfo | None
     )
 
 
+def _metadata_track_from_entry(
+    entry: dict,
+    query: str,
+    source: str,
+) -> "TrackInfo | None":
+    """Build a flat metadata candidate without requesting its media formats."""
+    webpage_url = entry.get("webpage_url") or entry.get("original_url") or ""
+    if not webpage_url and entry.get("id") and source in (
+        SOURCE_YOUTUBE,
+        SOURCE_YOUTUBE_MUSIC,
+    ):
+        webpage_url = f"https://music.youtube.com/watch?v={entry['id']}" \
+            if source == SOURCE_YOUTUBE_MUSIC \
+            else f"https://www.youtube.com/watch?v={entry['id']}"
+    if not webpage_url:
+        return None
+
+    return TrackInfo(
+        url=webpage_url,
+        title=entry.get("title") or query,
+        duration=_fmt_duration(entry.get("duration") or 0),
+        thumbnail=entry.get("thumbnail", ""),
+        source=source,
+    )
+
+
+def _resolve_metadata_track(
+    candidate: "TrackInfo",
+    query: str,
+) -> "TrackInfo | None":
+    """Resolve one flat candidate through the authenticated stream path."""
+    info = _extract_info_with_fallback(candidate["url"], use_cookies=True)
+    if info is None:
+        return None
+    return _extract_track(info, query, candidate["source"])
+
+
 def _title_tokens(value: str) -> set[str]:
     """Return comparable words from Arabic or Latin song text."""
     normalized = _strip_tashkeel(unicodedata.normalize("NFKC", value)).casefold()
@@ -881,17 +969,18 @@ def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "Tra
 
 def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
     """
-    Search YouTube for *query* via ``ytsearch20`` and return the best result.
+    Search YouTube for *query* via a small ``ytsearch5`` metadata page and
+    return the best playable result.
 
-    Tries exact and progressively normalized variants to tolerate Arabic
-    tashkeel, special characters, long release names, and minor misspellings.
+    Uses one normalized query variant to avoid duplicate provider requests while
+    retaining the exact user query as the first search form.
 
     Returns None when all variants fail so the caller can fall through to the
     next source.  Never raises.
     """
     best: TrackInfo | None = None
     best_score = -1.0
-    for q in _search_query_variants(query):
+    for q in _search_query_variants(query)[:_SEARCH_VARIANT_LIMIT]:
         track = _search_track_with_client_fallback(
             f"ytsearch{_SEARCH_RESULT_LIMIT}:{q}",
             q,
@@ -924,7 +1013,7 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
         # A few normalized variants improve Arabic/punctuation tolerance while
         # avoiding the large number of extraction requests used by the broader
         # provider searches.
-        variants = _search_query_variants(query)[:3]
+        variants = _search_query_variants(query)[:_SEARCH_VARIANT_LIMIT]
         results: list[dict] = []
         seen_video_ids: set[str] = set()
 
@@ -932,7 +1021,7 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
             catalog_results = catalog.search(
                 candidate_query,
                 filter="songs",
-                limit=8,
+                limit=_YOUTUBE_MUSIC_RESULT_LIMIT,
             )
             for result in catalog_results or []:
                 video_id = result.get("videoId")
@@ -963,7 +1052,7 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
         for result in results:
             video_id = result["videoId"]
             music_url = f"https://music.youtube.com/watch?v={video_id}"
-            info = _extract_info_with_fallback(music_url)
+            info = _extract_info_with_fallback(music_url, use_cookies=True)
             if info is None:
                 continue
 
@@ -997,7 +1086,7 @@ def search_soundcloud(query: str) -> "TrackInfo | None":
     """
     best: TrackInfo | None = None
     best_score = -1.0
-    for candidate in _search_query_variants(query):
+    for candidate in _search_query_variants(query)[:_SEARCH_VARIANT_LIMIT]:
         track = _search_track_with_client_fallback(
             f"scsearch{_SEARCH_RESULT_LIMIT}:{candidate}",
             candidate,

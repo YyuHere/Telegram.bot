@@ -68,6 +68,12 @@ images; for deployment, provide an equivalent secure mounted path through
 `YTDLP_COOKIE_FILE` rather than copying credentials into the image. Treat
 browser cookies like passwords and rotate them if they are ever exposed.
 
+The resolver keeps provider searches metadata-only, resolves only the selected
+song, spaces requests between attempts, and uses exponential retry backoff
+(`YTDLP_RETRY_DELAY`, default 8 seconds) for transient failures. Cookies are
+omitted from metadata searches and used only for authenticated page/stream
+resolution.
+
 ## Deployment
 
 Deployed on Railway using the `Procfile` (`worker: python main.py`) or `Dockerfile`.
