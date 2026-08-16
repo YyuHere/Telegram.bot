@@ -30,8 +30,8 @@ A production-ready Telegram group management bot with a companion Pyrogram userb
 │   └── replies.py           # Auto-reply system (اضافه رد)
 │
 └── music/
-    ├── commands.py          # /play /stop /pause /resume /skip (placeholder)
-    └── player.py            # pytgcalls audio engine + queue
+    ├── commands.py          # /play /queue /stop /skip + Arabic aliases
+    └── player.py            # pytgcalls audio engine + per-chat queue
 ```
 
 ## How to Run
@@ -73,6 +73,12 @@ song, spaces requests between attempts, and uses exponential retry backoff
 (`YTDLP_RETRY_DELAY`, default 8 seconds) for transient failures. Cookies are
 omitted from metadata searches and used only for authenticated page/stream
 resolution.
+
+Playback requests are isolated by Telegram chat ID. `/play`, `/queue`,
+تشغيل, and queued songs share that chat's local queue; the next queued song
+starts automatically when the current stream ends. `/stop` and اسكت stop
+playback and clear the chat queue, while `/skip` and تخطى advance to the next
+queued song.
 
 ## Deployment
 

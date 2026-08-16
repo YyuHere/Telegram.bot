@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _GROUP_FILTER   = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
 _AR_PLAY_RE     = re.compile(r"^تشغيل\b", re.UNICODE)
 _AR_PLAY_FILTER = filters.Regex(_AR_PLAY_RE)
+_AR_STOP_RE     = re.compile(r"^اسكت\b", re.UNICODE)
+_AR_SKIP_RE     = re.compile(r"^تخطى\b", re.UNICODE)
+_AR_STOP_FILTER = filters.Regex(_AR_STOP_RE)
+_AR_SKIP_FILTER = filters.Regex(_AR_SKIP_RE)
 
 # ─── Callback data prefixes ───────────────────────────────────────────────────
 
@@ -152,13 +156,9 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """
     Shared handler for /play and the Arabic تشغيل trigger.
 
-    Always starts the requested track immediately:
-      • Nothing playing  → join voice chat and start streaming.
-      • Already playing  → replace current track instantly (change_stream),
-                           clear the queue.  Mirrors X-Music / professional bot
-                           behaviour — no silent queuing on /play.
-
-    Users who want to queue without interrupting can use /queue <song>.
+    A request starts immediately when the chat is idle. If another track is
+    already playing, the new track is appended to this chat's local queue and
+    starts automatically when the current stream ends.
     """
     msg  = update.message
     text = msg.text or ""
@@ -227,15 +227,24 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{src_msg}\n⏱️ مدة الأغنية: {track['duration']}"
     )
 
-    # ── Play immediately (replace if already streaming) ───────────────────────
+    # ── Start immediately or append to this chat's queue ──────────────────────
     try:
-        await player.play(chat_id, track)
+        was_queued = await player.enqueue(chat_id, track)
     except Exception as exc:
-        logger.error("play() failed in chat %s: %s", chat_id, exc)
+        logger.error("enqueue() failed in chat %s: %s", chat_id, exc)
         await status.edit_text(f"❌ فشل تشغيل الصوت: {exc}")
         return
 
     await status.delete()
+
+    if was_queued:
+        queue_len = len(player._get_state(chat_id)["queue"])
+        await msg.reply_text(
+            f"📥 تمت إضافة الأغنية إلى قائمة الانتظار (#{queue_len}):\n"
+            f"▶ *{track['title']}* ({track['duration']})",
+            parse_mode="Markdown",
+        )
+        return
 
     bot_username = await _get_bot_username(context.bot)
     await _send_now_playing(msg, track, chat_id, user, bot_username)
@@ -243,8 +252,11 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /queue <song> — add a track to the end of the queue without interrupting
-    whatever is currently playing.  If nothing is playing, starts immediately.
+    Backward-compatible /queue handler.
+
+    /play and تشغيل now use the same enqueue behavior, so /queue remains
+    available as an explicit alias for users who want to make that intent
+    clear.
     """
     msg  = update.message
     text = msg.text or ""
@@ -308,6 +320,36 @@ async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Nothing was playing — started immediately
         bot_username = await _get_bot_username(context.bot)
         await _send_now_playing(msg, track, chat_id, user, bot_username)
+
+
+async def _handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop playback and clear this chat's queue."""
+    msg = update.message
+    chat_id = msg.chat.id
+    try:
+        await player.stop(chat_id)
+        await msg.reply_text("⏹️ تم إيقاف التشغيل ومسح قائمة الانتظار")
+    except Exception as exc:
+        logger.error("stop() failed in chat %s: %s", chat_id, exc)
+        await msg.reply_text(f"❌ فشل إيقاف التشغيل: {exc}")
+
+
+async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Skip this chat's current track and start its next queued track."""
+    msg = update.message
+    chat_id = msg.chat.id
+    try:
+        next_track = await player.skip(chat_id)
+        if next_track:
+            await msg.reply_text(
+                f"⏭️ تم التخطي إلى:\n▶ *{next_track['title']}*",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.reply_text("⏭️ لا توجد أغانٍ أخرى في قائمة الانتظار")
+    except Exception as exc:
+        logger.error("skip() failed in chat %s: %s", chat_id, exc)
+        await msg.reply_text(f"❌ فشل التخطي: {exc}")
 
 
 # ─── Callback helpers ─────────────────────────────────────────────────────────
@@ -409,7 +451,7 @@ def register(app: Application) -> None:
     # into private groups when assistant.join_chat() alone is not enough.
     player.set_bot(app.bot)
 
-    # /play — always plays immediately (replaces current track), groups only
+    # /play — starts immediately or appends to this chat's queue
     app.add_handler(CommandHandler("play", _handle_play, filters=_GROUP_FILTER))
 
     # Arabic "تشغيل" trigger — groups only
@@ -419,6 +461,16 @@ def register(app: Application) -> None:
 
     # /queue — add to queue without interrupting current track, groups only
     app.add_handler(CommandHandler("queue", _handle_queue, filters=_GROUP_FILTER))
+
+    # Stop/skip commands and Arabic aliases, groups only.
+    app.add_handler(CommandHandler("stop", _handle_stop, filters=_GROUP_FILTER))
+    app.add_handler(CommandHandler("skip", _handle_skip, filters=_GROUP_FILTER))
+    app.add_handler(
+        MessageHandler(_GROUP_FILTER & _AR_STOP_FILTER, _handle_stop)
+    )
+    app.add_handler(
+        MessageHandler(_GROUP_FILTER & _AR_SKIP_FILTER, _handle_skip)
+    )
 
     # Playback control callbacks
     app.add_handler(CallbackQueryHandler(_cb_play,   pattern=rf"^{_CB_PLAY}_-?\d+$"))

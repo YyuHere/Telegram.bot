@@ -168,7 +168,7 @@ def main() -> None:
     moderation.register(app)       # /ban /unban /kick /mute /unmute + Arabic triggers
     ludo.register(app)             # Ludo Club code extractor
     replies.register(app)          # اضافه رد interactive flow + auto-reply
-    music_commands.register(app)   # /play etc. — placeholder responses
+    music_commands.register(app)   # /play, queue, stop, skip + Arabic aliases
 
     # 5. Start polling
     logger.info("Bot is starting — polling for updates…")
