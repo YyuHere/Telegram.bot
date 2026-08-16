@@ -909,6 +909,39 @@ def _title_tokens(value: str) -> set[str]:
     return {token for token in normalized.split() if len(token) > 1}
 
 
+def _normalized_title(value: str) -> str:
+    """Normalize punctuation and spacing for exact song-title comparisons."""
+    normalized = _strip_tashkeel(unicodedata.normalize("NFKC", value)).casefold()
+    normalized = _SEARCH_PUNCTUATION_RE.sub(" ", normalized)
+    return " ".join(normalized.split())
+
+
+def _youtube_music_result_is_exact(result: dict, query: str) -> bool:
+    """
+    Return whether a YouTube Music result names the requested song exactly.
+
+    The title is the primary identity. Artist-title combinations are also
+    accepted because users commonly enter both fields in one request.
+    """
+    normalized_query = _normalized_title(query)
+    title = _normalized_title(result.get("title") or "")
+    if title == normalized_query:
+        return True
+
+    artists = " ".join(
+        artist.get("name") or ""
+        for artist in (result.get("artists") or [])
+        if isinstance(artist, dict)
+    )
+    normalized_artists = _normalized_title(artists)
+    if not normalized_artists:
+        return False
+    return (
+        _normalized_title(f"{artists} {result.get('title') or ''}") == normalized_query
+        or _normalized_title(f"{result.get('title') or ''} {artists}") == normalized_query
+    )
+
+
 def _match_score(query: str, track: "TrackInfo") -> float:
     """
     Score how closely a playable result matches the requested song name.
@@ -969,28 +1002,26 @@ def _extract_track(info: dict, query: str, source: str = SOURCE_YOUTUBE) -> "Tra
 
 def search_youtube(query: str, source_tag: str = SOURCE_YOUTUBE) -> "TrackInfo | None":
     """
-    Search YouTube for *query* via a small ``ytsearch5`` metadata page and
-    return the best playable result.
+    Search standard YouTube for *query* via the literal ``ytsearch:`` fallback
+    prefix and return its first playable result.
 
-    Uses one normalized query variant to avoid duplicate provider requests while
-    retaining the exact user query as the first search form.
+    YouTube Music is attempted before this function by ``get_audio_info``.
+    Uses one query variant to avoid duplicate provider requests while retaining
+    the exact user query as the first search form.
 
     Returns None when all variants fail so the caller can fall through to the
     next source.  Never raises.
     """
-    best: TrackInfo | None = None
-    best_score = -1.0
     for q in _search_query_variants(query)[:_SEARCH_VARIANT_LIMIT]:
         track = _search_track_with_client_fallback(
-            f"ytsearch{_SEARCH_RESULT_LIMIT}:{q}",
+            f"ytsearch:{q}",
             q,
             source_tag,
         )
-        if track and _match_score(query, track) > best_score:
-            best, best_score = track, _match_score(query, track)
-    if best:
-        logger.info("YouTube search: found %r for query %r", best["title"], query)
-    return best
+        if track:
+            logger.info("YouTube search: found %r for query %r", track["title"], query)
+            return track
+    return None
 
 
 def search_youtube_music(query: str) -> "TrackInfo | None":
@@ -1033,21 +1064,18 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
             logger.info("YouTube Music search returned no songs for %r", query)
             return None
 
-        # Try the closest catalog matches first. A failed/blocked result should
-        # not prevent the next song result from being extracted.
-        results.sort(
-            key=lambda result: _match_score(
-                query,
-                TrackInfo(
-                    url="",
-                    title=result.get("title") or query,
-                    duration=_fmt_duration(result.get("duration_seconds") or 0),
-                    thumbnail="",
-                    source=SOURCE_YOUTUBE_MUSIC,
-                ),
-            ),
-            reverse=True,
-        )
+        # Keep the catalog's result order, but move exact title/artist-title
+        # matches ahead of fuzzy matches. This avoids replacing the requested
+        # festival/song with a more popular but differently named result.
+        exact_results = [
+            result for result in results
+            if _youtube_music_result_is_exact(result, query)
+        ]
+        exact_ids = {result.get("videoId") for result in exact_results}
+        results = exact_results + [
+            result for result in results
+            if result.get("videoId") not in exact_ids
+        ]
 
         for result in results:
             video_id = result["videoId"]
@@ -1059,9 +1087,10 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
             track = _extract_track(info, query, SOURCE_YOUTUBE_MUSIC)
             if track:
                 logger.info(
-                    "YouTube Music search: found %r for query %r",
+                    "YouTube Music search: found %r for query %r (exact=%s)",
                     track["title"],
                     query,
+                    _youtube_music_result_is_exact(result, query),
                 )
                 return track
 
