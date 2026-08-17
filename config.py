@@ -37,10 +37,19 @@ YTDLP_COOKIE_FILE: str = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
 
 # Keep provider requests bounded. yt-dlp retries are disabled in the player;
 # these values only control the per-request timeout and the short cooldown
-# after YouTube blocks a request.
+# after YouTube blocks a request. The Android VR client is the stable
+# AnonXMusic-compatible default; do not rotate through a large client list.
 YTDLP_REQUEST_DELAY: float = float(os.getenv("YTDLP_REQUEST_DELAY", "1.5"))
 YTDLP_SOCKET_TIMEOUT: float = float(os.getenv("YTDLP_SOCKET_TIMEOUT", "8"))
 YTDLP_BLOCK_COOLDOWN: float = float(os.getenv("YTDLP_BLOCK_COOLDOWN", "60"))
+YTDLP_PLAYER_CLIENT: str = (
+    os.getenv("YTDLP_PLAYER_CLIENT", "android_vr").strip() or "android_vr"
+)
+
+# FFmpeg transport timeout for direct CDN streams. This is separate from the
+# yt-dlp extraction timeout because extraction has already completed by the
+# time PyTgCalls starts reading the stream.
+YTDLP_STREAM_TIMEOUT: float = float(os.getenv("YTDLP_STREAM_TIMEOUT", "15"))
 
 # Bot admin user ID — the only user allowed to add replies via private DM.
 # Set BOT_ADMIN_ID in Replit Secrets (integer Telegram user ID).

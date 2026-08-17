@@ -128,10 +128,18 @@ def _resolve_stream_builder():
                 "-hide_banner",
                 "-loglevel", "warning",
                 "-nostdin",
+                # Direct CDN audio needs no long format-probing phase.
+                "-analyzeduration", "0",
+                "-probesize", "32768",
                 "-reconnect", "1",
-                "-reconnect_at_eof", "1",
+                # EOF is the normal end of a song. Let PyTgCalls observe it
+                # and advance the queue instead of reopening the URL forever.
+                "-reconnect_at_eof", "0",
                 "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_on_http_error", "429,500,502,503,504",
                 "-reconnect_delay_max", "2",
+                "-rw_timeout", str(int(config.YTDLP_STREAM_TIMEOUT * 1_000_000)),
                 "-i", url,
                 "-vn",
                 "-sn",
@@ -541,7 +549,7 @@ def _is_direct_audio_url(url: str) -> bool:
 # cookie jar. "web", "ios", "mweb", and embedded clients stay out of the hot
 # path.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
-    ("android_vr",),
+    (config.YTDLP_PLAYER_CLIENT,),
 )
 _COOKIE_CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
     *_CLIENT_FALLBACK_CHAIN,
@@ -660,7 +668,7 @@ def _client_fallback_chain(
 
 def _ydl_opts(
     extra: dict | None = None,
-    player_clients: tuple[str, ...] = ("android_vr",),
+    player_clients: tuple[str, ...] = (config.YTDLP_PLAYER_CLIENT,),
     *,
     use_cookies: bool = False,
 ) -> dict:
@@ -681,7 +689,9 @@ def _ydl_opts(
         # No specific itag is guaranteed across clients, so prefer an
         # audio-only stream when one exists and otherwise fall through to
         # whatever the client actually returns.
-        "format": "bestaudio/best[acodec!=none]/best",
+        # AnonXMusic-style audio-first selection: prefer native audio-only
+        # M4A, then any audio-only format, and use mixed media only last.
+        "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/best",
         "quiet": True,
         # Messages are still captured — just routed through our own
         # logger (see _YtdlpDiagnosticLogger) instead of being discarded.

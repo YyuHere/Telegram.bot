@@ -1,3 +1,4 @@
 - [YouTube extractor client choice](youtube-extractor-client.md) — prefer android_vr before tv because tv can expose DRM-only results and misleading extraction warnings.
 - [Cookie handling](yt-dlp-cookie-handling.md) — never commit browser cookies; use ignored local files or secure environment injection.
 - [PyTgCalls 2.x API](pytgcalls-api.md) — current releases use play/leave_call/pause/resume instead of legacy join/change/leave methods.
+- [FFmpeg stream lifecycle](ffmpeg-stream-lifecycle.md) — reconnect transient CDN failures, but never reconnect at EOF or queue advancement can stall.

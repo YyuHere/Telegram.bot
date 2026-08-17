@@ -73,9 +73,18 @@ Authenticated extraction uses that file only when it exists and is non-empty.
 bot-challenge response.
 
 The resolver keeps provider searches metadata-only, resolves only the selected
-song, limits YouTube to a small client fallback chain, and fails fast on 429,
-bot-challenge, and authentication-block responses. Cookies are omitted from
-metadata searches and used only for authenticated page/stream resolution.
+song, uses the stable Android VR YouTube client by default, and fails fast on
+429, bot-challenge, and authentication-block responses instead of cycling
+through restricted clients. A cookie-enabled deployment may use one bounded
+`web_safari` fallback. Cookies are omitted from metadata searches and used only
+for authenticated page/stream resolution.
+
+`YTDLP_PLAYER_CLIENT` can override the primary yt-dlp player client when a
+deployment has a tested alternative, but a long client rotation is
+intentionally unsupported because it multiplies YouTube requests and makes
+429s more likely. `YTDLP_STREAM_TIMEOUT` bounds FFmpeg's direct CDN transport
+read. FFmpeg reconnects only for transient network/5xx/429 failures and does
+not reconnect at EOF, so completed songs advance normally.
 
 Playback requests are isolated by Telegram chat ID. `/play`, `/queue`,
 تشغيل, and قائمة share that chat's local queue; the next queued song starts
