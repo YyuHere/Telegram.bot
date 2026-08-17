@@ -544,16 +544,13 @@ def _is_direct_audio_url(url: str) -> bool:
 # several YouTube requests, so cycling through a long list amplifies 429s and
 # bot challenges instead of improving reliability.
 #
-# android_vr is preferred because it avoids the tv client's DRM-only results.
-# web_safari is the one bounded fallback that can make better use of a browser
-# cookie jar. "web", "ios", "mweb", and embedded clients stay out of the hot
-# path.
+# Mobile clients are intentionally the only supported YouTube path here.
+# "web", "tv", "ios", and browser-cookie fallbacks are excluded: rotating
+# through restricted clients multiplies requests and makes 429s more likely.
+# android_vr remains available as an explicit configuration alternative, but
+# android is the default AnonXMusic-compatible client.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
     (config.YTDLP_PLAYER_CLIENT,),
-)
-_COOKIE_CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
-    *_CLIENT_FALLBACK_CHAIN,
-    ("web_safari",),
 )
 
 _YOUTUBE_BLOCK_KEYWORDS = (
@@ -618,8 +615,12 @@ def _cookie_file_path() -> Path | None:
 
     path = Path(configured).expanduser()
     try:
-        if path.is_file() and path.stat().st_size > 0:
-            return path.resolve()
+        if not path.is_file():
+            return None
+        if path.stat().st_size <= 0:
+            logger.info("Ignoring empty yt-dlp cookie file: %s", path)
+            return None
+        return path.resolve()
     except OSError as exc:
         logger.warning("yt-dlp cookie file cannot be accessed: %s", exc)
     return None
@@ -660,9 +661,10 @@ def _client_fallback_chain(
     *,
     use_cookies: bool,
 ) -> tuple[tuple[str, ...], ...]:
-    """Return one client normally, or one bounded cookie-aware fallback."""
-    if use_cookies and _cookie_file_path() is not None:
-        return _COOKIE_CLIENT_FALLBACK_CHAIN
+    """Return the one mobile client, regardless of cookie availability."""
+    # Cookie presence must never change the client to web_safari or another
+    # restricted browser path. An empty/missing cookie jar simply means the
+    # same unauthenticated mobile extraction is used.
     return _CLIENT_FALLBACK_CHAIN
 
 
@@ -755,9 +757,11 @@ def _ydl_opts(
             opts["cookiefile"] = str(cookie_file)
             logger.debug("yt-dlp cookie file enabled: %s", cookie_file)
         else:
-            logger.warning(
-                "yt-dlp cookie authentication requested, but YTDLP_COOKIE_FILE "
-                "does not point to a non-empty file; continuing without cookies."
+            # Do not leave an empty/default path in the yt-dlp options. This
+            # cleanly falls back to the unauthenticated mobile stream.
+            logger.debug(
+                "yt-dlp cookie file unavailable; using unauthenticated %s extraction",
+                config.YTDLP_PLAYER_CLIENT,
             )
 
     return opts
