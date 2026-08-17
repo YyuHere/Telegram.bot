@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 # ─── Filters ──────────────────────────────────────────────────────────────────
 
 _GROUP_FILTER   = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
-_AR_PLAY_RE     = re.compile(r"^تشغيل(?:\s|$)", re.UNICODE)
-_AR_QUEUE_RE    = re.compile(r"^قائمة(?:\s|$)", re.UNICODE)
-_AR_STOP_RE     = re.compile(r"^اسكت(?:\s|$)", re.UNICODE)
-_AR_SKIP_RE     = re.compile(r"^تخطى(?:\s|$)", re.UNICODE)
+_AR_PLAY_ALIAS  = "تشغيل"
+_AR_QUEUE_ALIAS = "قائمة"
+_AR_STOP_ALIAS  = "اسكت"
+_AR_SKIP_ALIAS  = "تخطى"
+_AR_PLAY_RE     = re.compile(rf"^{_AR_PLAY_ALIAS}(?:\s|$)", re.UNICODE)
+_AR_QUEUE_RE    = re.compile(rf"^{_AR_QUEUE_ALIAS}(?:\s|$)", re.UNICODE)
+_AR_STOP_RE     = re.compile(rf"^{_AR_STOP_ALIAS}(?:\s|$)", re.UNICODE)
+_AR_SKIP_RE     = re.compile(rf"^{_AR_SKIP_ALIAS}(?:\s|$)", re.UNICODE)
 _AR_PLAY_FILTER = filters.Regex(_AR_PLAY_RE)
 _AR_QUEUE_FILTER = filters.Regex(_AR_QUEUE_RE)
 _AR_STOP_FILTER = filters.Regex(_AR_STOP_RE)
@@ -174,7 +178,9 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             query = after_cmd
     else:
-        query = _AR_PLAY_RE.sub("", text).strip()
+        # The Arabic filter has already verified this prefix. Slicing avoids
+        # running a second regex over the message before playback can start.
+        query = text[len(_AR_PLAY_ALIAS):].lstrip()
 
     if not query:
         await msg.reply_text("الرجاء كتابة اسم الاغنيه لتشغيلها")
@@ -263,15 +269,18 @@ async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     msg  = update.message
     text = msg.text or ""
 
-    # Strip either "/queue", "/queue@BotName", or the Arabic alias.
-    # Both forms intentionally feed the exact same queueing logic below.
-    after_cmd = text.split(None, 1)
-    query = after_cmd[1].strip() if len(after_cmd) > 1 else ""
-    command_word = after_cmd[0] if after_cmd else ""
-    if command_word.startswith("/"):
+    if text.startswith("/"):
+        # English commands still support Telegram's /queue@BotName form.
+        after_cmd = text.split(None, 1)
+        query = after_cmd[1].strip() if len(after_cmd) > 1 else ""
+        command_word = after_cmd[0]
         command_name = command_word[1:].split("@", 1)[0].lower()
         if command_name != "queue":
             query = ""
+    else:
+        # The Arabic filter has already verified this prefix, so avoid a
+        # general split/regex pass on the latency-sensitive Arabic path.
+        query = text[len(_AR_QUEUE_ALIAS):].lstrip()
 
     if not query:
         await msg.reply_text("الرجاء كتابة اسم الاغنية لإضافتها إلى قائمة الانتظار")
@@ -353,6 +362,17 @@ async def _handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as exc:
         logger.error("skip() failed in chat %s: %s", chat_id, exc)
         await msg.reply_text(f"❌ فشل التخطي: {exc}")
+
+
+# Direct alias-to-handler mapping. Arabic commands do not pass through a
+# translation or dispatch coroutine; each update is delivered to the same
+# handler used by its English command.
+_ARABIC_COMMAND_HANDLERS = {
+    _AR_PLAY_ALIAS: (_AR_PLAY_FILTER, _handle_play),
+    _AR_QUEUE_ALIAS: (_AR_QUEUE_FILTER, _handle_queue),
+    _AR_STOP_ALIAS: (_AR_STOP_FILTER, _handle_stop),
+    _AR_SKIP_ALIAS: (_AR_SKIP_FILTER, _handle_skip),
+}
 
 
 # ─── Callback helpers ─────────────────────────────────────────────────────────
@@ -457,26 +477,17 @@ def register(app: Application) -> None:
     # /play — starts immediately or appends to this chat's queue
     app.add_handler(CommandHandler("play", _handle_play, filters=_GROUP_FILTER))
 
-    # Arabic "تشغيل" trigger — groups only
-    app.add_handler(
-        MessageHandler(_GROUP_FILTER & _AR_PLAY_FILTER, _handle_play)
-    )
-
     # /queue — add to queue without interrupting current track, groups only
     app.add_handler(CommandHandler("queue", _handle_queue, filters=_GROUP_FILTER))
-    app.add_handler(
-        MessageHandler(_GROUP_FILTER & _AR_QUEUE_FILTER, _handle_queue)
-    )
 
-    # Stop/skip commands and Arabic aliases, groups only.
+    # Stop/skip commands, groups only.
     app.add_handler(CommandHandler("stop", _handle_stop, filters=_GROUP_FILTER))
     app.add_handler(CommandHandler("skip", _handle_skip, filters=_GROUP_FILTER))
-    app.add_handler(
-        MessageHandler(_GROUP_FILTER & _AR_STOP_FILTER, _handle_stop)
-    )
-    app.add_handler(
-        MessageHandler(_GROUP_FILTER & _AR_SKIP_FILTER, _handle_skip)
-    )
+
+    # Arabic aliases use the same group and registration priority as the
+    # English handlers, with no translation layer between filter and handler.
+    for _alias_filter, _handler in _ARABIC_COMMAND_HANDLERS.values():
+        app.add_handler(MessageHandler(_GROUP_FILTER & _alias_filter, _handler))
 
     # Playback control callbacks
     app.add_handler(CallbackQueryHandler(_cb_play,   pattern=rf"^{_CB_PLAY}_-?\d+$"))
