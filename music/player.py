@@ -17,6 +17,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from typing import TypedDict
@@ -531,28 +532,33 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
-# Client fallback order for the current (2026) SABR-enforcement landscape.
-# No single client is reliable for every video — YouTube's SABR rollout is
-# uneven per-video/per-region, and yt-dlp's own client support shifts often.
-# android_vr is preferred because it currently avoids the tv client's DRM path.
-# The remaining clients are tried in order when it returns no playable media:
-#   1. android_vr — usually exposes a full adaptiveFormats list without a
-#                   PO Token.
-#   2. android    — occasionally succeeds where the above doesn't.
-#   3. mweb       — mobile web; sometimes exposes formats other clients don't.
-# "tv" is intentionally excluded: it can return a non-empty result containing
-# only DRM-protected entries, which looks like a successful search but cannot
-# be handed to ffmpeg.
-# "web" and "ios" are deliberately NOT in this list: web is SABR-blocked and
-# ios needs a PO Token, so both fail immediately in most environments and
-# just waste a network round-trip before falling through.
+# Keep the client fallback deliberately small. Each client attempt can trigger
+# several YouTube requests, so cycling through a long list amplifies 429s and
+# bot challenges instead of improving reliability.
+#
+# android_vr is preferred because it avoids the tv client's DRM-only results.
+# web_safari is the one bounded fallback that can make better use of a browser
+# cookie jar. "web", "ios", "mweb", and embedded clients stay out of the hot
+# path.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
     ("android_vr",),
-    ("android",),
-    ("mweb",),
-    ("web_safari",),
-    ("web_embedded",),
 )
+_COOKIE_CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
+    *_CLIENT_FALLBACK_CHAIN,
+    ("web_safari",),
+)
+
+_YOUTUBE_BLOCK_KEYWORDS = (
+    "http error 429",
+    "429 too many requests",
+    "too many requests",
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "captcha",
+    "login required",
+)
+_youtube_blocked_until = 0.0
 
 
 class _YtdlpDiagnosticLogger:
@@ -590,17 +596,71 @@ class _YtdlpDiagnosticLogger:
         logger.warning("yt-dlp[%s] ERROR: %s", self._client_label, msg)
 
 
-def _retry_delay(attempt: int) -> float:
-    """Return an exponentially increasing delay for failed yt-dlp requests."""
-    return min(
-        config.YTDLP_RETRY_DELAY * (2 ** max(0, attempt - 1)),
-        60.0,
+def _cookie_file_path() -> Path | None:
+    """
+    Return the configured cookie jar only when it is a usable local file.
+
+    Cookie contents are never read into logs or application state. Resolving
+    the path prevents a workflow working-directory change from silently
+    disabling authentication.
+    """
+    configured = str(config.YTDLP_COOKIE_FILE or "").strip()
+    if not configured:
+        return None
+
+    path = Path(configured).expanduser()
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            return path.resolve()
+    except OSError as exc:
+        logger.warning("yt-dlp cookie file cannot be accessed: %s", exc)
+    return None
+
+
+def _youtube_target(target: str) -> bool:
+    lowered = target.lower()
+    return (
+        lowered.startswith(("ytsearch:", "ytsearch"))
+        or "youtube.com/" in lowered
+        or "youtu.be/" in lowered
     )
+
+
+def _is_youtube_block_error(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    return any(keyword in message for keyword in _YOUTUBE_BLOCK_KEYWORDS)
+
+
+def _mark_youtube_blocked(target: str, exc: Exception) -> None:
+    """Pause further YouTube attempts briefly after a provider block."""
+    global _youtube_blocked_until
+    cooldown = max(0.0, config.YTDLP_BLOCK_COOLDOWN)
+    _youtube_blocked_until = time.monotonic() + cooldown
+    logger.warning(
+        "YouTube blocked request %r; stopping client fallbacks for %.0fs: %s",
+        target,
+        cooldown,
+        exc,
+    )
+
+
+def _youtube_is_blocked(target: str) -> bool:
+    return _youtube_target(target) and time.monotonic() < _youtube_blocked_until
+
+
+def _client_fallback_chain(
+    *,
+    use_cookies: bool,
+) -> tuple[tuple[str, ...], ...]:
+    """Return one client normally, or one bounded cookie-aware fallback."""
+    if use_cookies and _cookie_file_path() is not None:
+        return _COOKIE_CLIENT_FALLBACK_CHAIN
+    return _CLIENT_FALLBACK_CHAIN
 
 
 def _ydl_opts(
     extra: dict | None = None,
-    player_clients: tuple[str, ...] = ("tv",),
+    player_clients: tuple[str, ...] = ("android_vr",),
     *,
     use_cookies: bool = False,
 ) -> dict:
@@ -639,19 +699,15 @@ def _ydl_opts(
         # handle a newly rotated player script.
         "remote_components": ["ejs:github"],
         "noplaylist": True,
-        # Keep retries limited and spaced out. A rapid retry burst makes a
-        # provider-side 429 worse and can extend the cooldown window.
-        "retries": 1,
-        "fragment_retries": 1,
-        "extractor_retries": 1,
-        "retry_sleep_functions": {
-            "http": _retry_delay,
-            "fragment": _retry_delay,
-            "extractor": _retry_delay,
-            "file_access": _retry_delay,
-        },
+        # Do not let yt-dlp internally retry a blocked request. The caller
+        # owns the small, explicit client fallback below and can fail fast on
+        # 429/challenge responses.
+        "retries": 0,
+        "fragment_retries": 0,
+        "extractor_retries": 0,
+        "file_access_retries": 0,
         "sleep_interval_requests": config.YTDLP_REQUEST_DELAY,
-        "socket_timeout": 15,
+        "socket_timeout": config.YTDLP_SOCKET_TIMEOUT,
         # Search calls are metadata-only. The selected page is resolved in a
         # separate authenticated call, so yt-dlp never expands every result
         # just to inspect its formats.
@@ -663,7 +719,8 @@ def _ydl_opts(
         "writeinfojson": False,
         "getcomments": False,
         "writeannotations": False,
-        "ignoreerrors": "only_download",
+        # Extraction failures must raise so the fallback can classify them.
+        "ignoreerrors": False,
         "extractor_args": {
             "youtube": {"player_client": list(player_clients)},
         },
@@ -682,10 +739,16 @@ def _ydl_opts(
     # Cookies are for authenticated page/stream resolution only. Metadata
     # searches intentionally omit the jar to avoid sending account cookies to
     # provider search endpoints and to keep catalog scans lightweight.
-    cookie_file = Path(config.YTDLP_COOKIE_FILE).expanduser()
-    if use_cookies and cookie_file.is_file():
-        opts["cookiefile"] = str(cookie_file)
-        logger.debug("yt-dlp cookie file enabled: %s", cookie_file)
+    if use_cookies:
+        cookie_file = _cookie_file_path()
+        if cookie_file is not None:
+            opts["cookiefile"] = str(cookie_file)
+            logger.debug("yt-dlp cookie file enabled: %s", cookie_file)
+        else:
+            logger.warning(
+                "yt-dlp cookie authentication requested, but YTDLP_COOKIE_FILE "
+                "does not point to a non-empty file; continuing without cookies."
+            )
 
     return opts
 
@@ -697,16 +760,19 @@ def _extract_info_with_fallback(
     use_cookies: bool = True,
 ) -> dict | None:
     """
-    Run yt_dlp.extract_info(target) trying each client in
-    _CLIENT_FALLBACK_CHAIN in order, returning the first successful result.
+    Run yt_dlp.extract_info(target) through the bounded client chain, returning
+    the first successful result. A YouTube 429 or bot challenge immediately
+    opens a short circuit-breaker window instead of trying more clients.
 
-    Centralizes the SABR-workaround retry logic so every caller (search,
-    direct URL resolution) benefits automatically without duplicating the
-    try/except chain. Returns None if every client fails; the specific
-    exception from the last attempt is logged at WARNING level.
+    Centralizes the limited SABR fallback so every caller (search, direct URL
+    resolution) gets the same fail-fast behavior. Returns None if the provider
+    is blocked or every bounded client attempt fails.
     """
     last_exc: Exception | None = None
-    for clients in _CLIENT_FALLBACK_CHAIN:
+    for clients in _client_fallback_chain(use_cookies=use_cookies):
+        if _youtube_is_blocked(target):
+            logger.info("Skipping YouTube request during provider cooldown: %r", target)
+            return None
         opts = _ydl_opts(
             extra,
             player_clients=clients,
@@ -715,12 +781,6 @@ def _extract_info_with_fallback(
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 result = ydl.extract_info(target, download=False)
-            # With ignoreerrors=only_download, a single-video extraction
-            # that fails on *this* client returns None instead of raising —
-            # that's still a failure for this client, so fall through to
-            # the next one in the chain rather than stopping here. For a
-            # ytsearchN target, a non-None result with some/all entries
-            # None is fine; _extract_track already filters those out.
             if result is not None:
                 return result
             logger.debug(
@@ -729,6 +789,9 @@ def _extract_info_with_fallback(
             )
         except Exception as exc:
             last_exc = exc
+            if _youtube_target(target) and _is_youtube_block_error(exc):
+                _mark_youtube_blocked(target, exc)
+                return None
             logger.debug(
                 "extract_info(%r) failed with client(s) %s: %s",
                 target, clients, exc,
@@ -754,7 +817,10 @@ def _search_track_with_client_fallback(
     of HTTP 429 responses. Search results are now flat metadata; only the
     selected page receives the authenticated extraction call.
     """
-    for clients in _CLIENT_FALLBACK_CHAIN:
+    for clients in _client_fallback_chain(use_cookies=False):
+        if _youtube_is_blocked(target):
+            logger.info("Skipping YouTube search during provider cooldown: %r", target)
+            return None
         opts = _ydl_opts(
             player_clients=clients,
             use_cookies=False,
@@ -763,6 +829,9 @@ def _search_track_with_client_fallback(
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(target, download=False)
         except Exception as exc:
+            if _youtube_target(target) and _is_youtube_block_error(exc):
+                _mark_youtube_blocked(target, exc)
+                return None
             logger.debug(
                 "Search %r failed with client(s) %s: %s", query, clients, exc,
             )

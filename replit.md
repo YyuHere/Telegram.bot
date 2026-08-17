@@ -67,12 +67,15 @@ avoid YouTube 403 responses. The file is Git-ignored and excluded from Docker
 images; for deployment, provide an equivalent secure mounted path through
 `YTDLP_COOKIE_FILE` rather than copying credentials into the image. Treat
 browser cookies like passwords and rotate them if they are ever exposed.
+Authenticated extraction uses that file only when it exists and is non-empty.
+`YTDLP_SOCKET_TIMEOUT` defaults to 8 seconds, and
+`YTDLP_BLOCK_COOLDOWN` defaults to 60 seconds after a YouTube rate-limit or
+bot-challenge response.
 
 The resolver keeps provider searches metadata-only, resolves only the selected
-song, spaces requests between attempts, and uses exponential retry backoff
-(`YTDLP_RETRY_DELAY`, default 8 seconds) for transient failures. Cookies are
-omitted from metadata searches and used only for authenticated page/stream
-resolution.
+song, limits YouTube to a small client fallback chain, and fails fast on 429,
+bot-challenge, and authentication-block responses. Cookies are omitted from
+metadata searches and used only for authenticated page/stream resolution.
 
 Playback requests are isolated by Telegram chat ID. `/play`, `/queue`,
 تشغيل, and قائمة share that chat's local queue; the next queued song starts

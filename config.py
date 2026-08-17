@@ -35,11 +35,12 @@ SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 # out of source control and set this to another mounted path in deployment.
 YTDLP_COOKIE_FILE: str = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
 
-# Keep provider retries sparse so a temporary 429 does not become a request
-# burst. This is a delay between failed attempts, not a delay before metadata
-# searches.
-YTDLP_RETRY_DELAY: float = float(os.getenv("YTDLP_RETRY_DELAY", "8"))
+# Keep provider requests bounded. yt-dlp retries are disabled in the player;
+# these values only control the per-request timeout and the short cooldown
+# after YouTube blocks a request.
 YTDLP_REQUEST_DELAY: float = float(os.getenv("YTDLP_REQUEST_DELAY", "1.5"))
+YTDLP_SOCKET_TIMEOUT: float = float(os.getenv("YTDLP_SOCKET_TIMEOUT", "8"))
+YTDLP_BLOCK_COOLDOWN: float = float(os.getenv("YTDLP_BLOCK_COOLDOWN", "60"))
 
 # Bot admin user ID — the only user allowed to add replies via private DM.
 # Set BOT_ADMIN_ID in Replit Secrets (integer Telegram user ID).
