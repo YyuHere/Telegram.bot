@@ -75,10 +75,10 @@ omitted from metadata searches and used only for authenticated page/stream
 resolution.
 
 Playback requests are isolated by Telegram chat ID. `/play`, `/queue`,
-تشغيل, and queued songs share that chat's local queue; the next queued song
-starts automatically when the current stream ends. `/stop` and اسكت stop
-playback and clear the chat queue, while `/skip` and تخطى advance to the next
-queued song.
+تشغيل, and قائمة share that chat's local queue; the next queued song starts
+automatically when the current stream ends. `/stop` and
+اسكت stop playback and clear the chat queue, while `/skip` and تخطى advance to
+the next queued song.
 
 ## Deployment
 

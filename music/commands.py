@@ -34,10 +34,12 @@ logger = logging.getLogger(__name__)
 # ─── Filters ──────────────────────────────────────────────────────────────────
 
 _GROUP_FILTER   = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
-_AR_PLAY_RE     = re.compile(r"^تشغيل\b", re.UNICODE)
+_AR_PLAY_RE     = re.compile(r"^تشغيل(?:\s|$)", re.UNICODE)
+_AR_QUEUE_RE    = re.compile(r"^قائمة(?:\s|$)", re.UNICODE)
+_AR_STOP_RE     = re.compile(r"^اسكت(?:\s|$)", re.UNICODE)
+_AR_SKIP_RE     = re.compile(r"^تخطى(?:\s|$)", re.UNICODE)
 _AR_PLAY_FILTER = filters.Regex(_AR_PLAY_RE)
-_AR_STOP_RE     = re.compile(r"^اسكت\b", re.UNICODE)
-_AR_SKIP_RE     = re.compile(r"^تخطى\b", re.UNICODE)
+_AR_QUEUE_FILTER = filters.Regex(_AR_QUEUE_RE)
 _AR_STOP_FILTER = filters.Regex(_AR_STOP_RE)
 _AR_SKIP_FILTER = filters.Regex(_AR_SKIP_RE)
 
@@ -252,7 +254,7 @@ async def _handle_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Backward-compatible /queue handler.
+    Shared handler for /queue and the Arabic قائمة trigger.
 
     /play and تشغيل now use the same enqueue behavior, so /queue remains
     available as an explicit alias for users who want to make that intent
@@ -261,14 +263,15 @@ async def _handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     msg  = update.message
     text = msg.text or ""
 
-    # Strip "/queue" or "/queue@BotName"
+    # Strip either "/queue", "/queue@BotName", or the Arabic alias.
+    # Both forms intentionally feed the exact same queueing logic below.
     after_cmd = text.split(None, 1)
     query = after_cmd[1].strip() if len(after_cmd) > 1 else ""
-
-    # Strip bot-username suffix from the command word itself if present
-    if query.startswith("@"):
-        parts = query.split(None, 1)
-        query = parts[1].strip() if len(parts) > 1 else ""
+    command_word = after_cmd[0] if after_cmd else ""
+    if command_word.startswith("/"):
+        command_name = command_word[1:].split("@", 1)[0].lower()
+        if command_name != "queue":
+            query = ""
 
     if not query:
         await msg.reply_text("الرجاء كتابة اسم الاغنية لإضافتها إلى قائمة الانتظار")
@@ -461,6 +464,9 @@ def register(app: Application) -> None:
 
     # /queue — add to queue without interrupting current track, groups only
     app.add_handler(CommandHandler("queue", _handle_queue, filters=_GROUP_FILTER))
+    app.add_handler(
+        MessageHandler(_GROUP_FILTER & _AR_QUEUE_FILTER, _handle_queue)
+    )
 
     # Stop/skip commands and Arabic aliases, groups only.
     app.add_handler(CommandHandler("stop", _handle_stop, filters=_GROUP_FILTER))
