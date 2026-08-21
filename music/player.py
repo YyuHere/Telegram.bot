@@ -2,7 +2,7 @@
 music/player.py — Core audio streaming engine.
 
 Uses:
-  • yt-dlp     — Download / stream audio from YouTube and 500+ sites.
+  • yt-dlp     — Download / stream audio from YouTube.
   • pytgcalls  — Stream audio into a Telegram Voice Chat via the Assistant userbot.
 
 Per-chat state tracks the queue, current track, repeat mode, and paused flag
@@ -267,7 +267,7 @@ class TrackInfo(TypedDict):
     title: str
     duration: str       # "m:ss"
     thumbnail: str      # URL
-    source: str         # "youtube_music" | "youtube" | "soundcloud" | "spotify" | "anghami"
+    source: str         # "youtube_music" | "youtube" | "spotify" | "anghami"
 
 
 # ─── Per-chat state ───────────────────────────────────────────────────────────
@@ -413,7 +413,6 @@ def health_check() -> dict:
 
 SOURCE_YOUTUBE = "youtube"
 SOURCE_YOUTUBE_MUSIC = "youtube_music"
-SOURCE_SOUNDCLOUD = "soundcloud"
 SOURCE_SPOTIFY = "spotify"   # Spotify metadata → YouTube stream
 SOURCE_ANGHAMI = "anghami"  # Anghami metadata → YouTube stream
 
@@ -445,7 +444,7 @@ def _strip_tashkeel(text: str) -> str:
 
 # Keep provider searches broad enough to find regional releases and alternate
 # spellings.  The old hard-coded ``5`` made a valid result disappear whenever
-# the first few YouTube/SoundCloud hits were remixes, clips, or unavailable.
+# the first few YouTube hits were remixes, clips, or unavailable.
 # Search only a small candidate set. The resolver now extracts one selected
 # result instead of expanding every search entry, so a large result page only
 # adds throttling without improving playback quality.
@@ -505,8 +504,8 @@ def _search_query_variants(query: str) -> list[str]:
     if len(words) > 4:
         _add(" ".join(words[:4]))
 
-    # These are deliberately last: they help YouTube/SoundCloud rank a full
-    # song over short clips without replacing the user's exact query.
+    # These are deliberately last: they help YouTube rank a full song over
+    # short clips without replacing the user's exact query.
     base = clean_punctuation_free or punctuation_free or stripped
     if base:
         _add(f"{base} audio")
@@ -518,7 +517,6 @@ def _search_query_variants(query: str) -> list[str]:
 _PLATFORM_HOSTS = (
     "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
     "music.youtube.com",
-    "soundcloud.com", "www.soundcloud.com",
     "spotify.com", "open.spotify.com",
     "anghami.com", "play.anghami.com",
 )
@@ -852,10 +850,10 @@ def _stream_url_from_info(info: dict) -> str:
     """
     Return a direct media URL from a yt-dlp info dict.
 
-    Search results are not guaranteed to be fully expanded.  In particular,
-    YouTube and SoundCloud may return an entry with only ``webpage_url`` while
-    the actual audio URL lives in ``formats``.  Never hand a webpage URL to
-    PyTgCalls: it expects a media stream that ffmpeg can open.
+    Search results are not guaranteed to be fully expanded. In particular,
+    YouTube may return an entry with only ``webpage_url`` while the actual
+    audio URL lives in ``formats``. Never hand a webpage URL to PyTgCalls: it
+    expects a media stream that ffmpeg can open.
     """
     formats = info.get("formats") or []
     candidates = [
@@ -866,8 +864,7 @@ def _stream_url_from_info(info: dict) -> str:
     ]
     if candidates:
         # Prefer audio-only formats and then the highest audio bitrate.  The
-        # latter is useful for SoundCloud, where formats often have no abr but
-        # do expose tbr.
+        # Some formats have no abr but do expose tbr, so use both when ranking.
         candidates.sort(
             key=lambda fmt: (
                 fmt.get("vcodec") in (None, "none"),
@@ -1001,7 +998,7 @@ def _match_score(query: str, track: "TrackInfo") -> float:
     Score how closely a playable result matches the requested song name.
 
     Provider ordering is intentionally not part of this score. An exact
-    SoundCloud/Anghami result should beat a vague YouTube result, and the
+    Anghami result should beat a vague YouTube result, and the
     same rule works for Arabic, transliterated Arabic, and Latin titles.
     """
     requested_tokens = _title_tokens(query)
@@ -1158,30 +1155,6 @@ def search_youtube_music(query: str) -> "TrackInfo | None":
     return None
 
 
-def search_soundcloud(query: str) -> "TrackInfo | None":
-    """
-    Search SoundCloud as a provider fallback.
-
-    SoundCloud is deliberately resolved through yt-dlp rather than scraping
-    HTML.  ``scsearch20`` returns multiple candidates; each candidate is
-    expanded and checked for a direct CDN URL, so one unavailable result does
-    not abort the whole search.
-    """
-    best: TrackInfo | None = None
-    best_score = -1.0
-    for candidate in _search_query_variants(query)[:_SEARCH_VARIANT_LIMIT]:
-        track = _search_track_with_client_fallback(
-            f"scsearch{_SEARCH_RESULT_LIMIT}:{candidate}",
-            candidate,
-            SOURCE_SOUNDCLOUD,
-        )
-        if track and _match_score(query, track) > best_score:
-            best, best_score = track, _match_score(query, track)
-    if best:
-        logger.info("SoundCloud search: found %r for query %r", best["title"], query)
-    return best
-
-
 def get_best_audio_url(url_or_id: str) -> "TrackInfo | None":
     """
     Extract the best audio stream URL from a YouTube video URL or ID.
@@ -1250,7 +1223,7 @@ def search_anghami(query: str) -> "str | None":
     ``"Artist - Track Name"`` to guide a refined YouTube search.
 
     Anghami is particularly strong for Arabic songs and mahraganat that
-    SoundCloud / Spotify may not carry.  Returns None on any failure so the
+    Spotify may not carry. Returns None on any failure so the
     caller can skip gracefully.  Never raises.
     """
     try:
@@ -1305,17 +1278,14 @@ def _search_anghami_stream(query: str) -> "TrackInfo | None":
 
 def _search_secondary_platforms(query: str) -> list["TrackInfo"]:
     """
-    Search non-YouTube secondary indexes concurrently and return playable
-    candidates.
+    Search metadata indexes concurrently and return YouTube-resolved candidates.
 
     YouTube Music and standard YouTube are resolved before this function is
-    called. Spotify and Anghami are metadata indexes only; the actual stream
-    is still resolved through a public, yt-dlp-supported media result. This
-    avoids depending on a login cookie, private API session, or a restricted
-    page from any one site.
+    called. Spotify and Anghami are metadata indexes only; both helpers call
+    ``search_youtube`` for the actual stream. No alternate audio provider is
+    queried here.
     """
     searches = {
-        "soundcloud": search_soundcloud,
         "spotify": _search_spotify_stream,
         "anghami": _search_anghami_stream,
     }
@@ -1359,9 +1329,8 @@ def get_audio_info(query: str) -> TrackInfo:
     0. Direct URL      — supported as an explicit user request only.
     1. YouTube Music   — song-focused catalog search and Music URL extraction.
     2. YouTube         — standard ``ytsearch20`` fallback.
-    3. SoundCloud      — ``scsearch20`` independent provider search.
-    4. Spotify         — optional metadata search → public stream search.
-    5. Anghami         — public metadata search → public stream search.
+    3. Spotify         — optional metadata search → YouTube stream search.
+    4. Anghami         — public metadata search → YouTube stream search.
 
     YouTube Music and standard YouTube are deliberately sequential so the
     primary source always wins when it can provide a playable stream. The
@@ -1370,6 +1339,13 @@ def get_audio_info(query: str) -> TrackInfo:
 
     Raises RuntimeError with an Arabic message when every stage fails.
     """
+    # SoundCloud is intentionally unsupported. Reject it before any resolver
+    # can treat it as a generic yt-dlp URL or search provider.
+    if "soundcloud.com" in query.casefold():
+        raise RuntimeError(
+            "❌ لم يتم العثور على الأغنية. SoundCloud غير مدعوم."
+        )
+
     # ── Stage 0: direct URL ───────────────────────────────────────────────────
     if _is_url(query):
         url = query if query.startswith(("http://", "https://")) else f"https://{query}"
@@ -1384,9 +1360,7 @@ def get_audio_info(query: str) -> TrackInfo:
             )
 
         # Determine source tag from the URL before extracting.
-        if "soundcloud.com" in url:
-            tag = SOURCE_SOUNDCLOUD
-        elif "anghami.com" in url:
+        if "anghami.com" in url:
             tag = SOURCE_ANGHAMI
         elif "spotify.com" in url:
             tag = SOURCE_SPOTIFY
@@ -1407,8 +1381,7 @@ def get_audio_info(query: str) -> TrackInfo:
         )
 
     # ── YouTube Music is the primary text search and stream source ─────────────
-    # Keep this before all other providers. A playable Music result must not be
-    # displaced by a higher-scoring result from standard YouTube or SoundCloud.
+    # Keep this before standard YouTube so a playable Music result wins.
     youtube_music_track = search_youtube_music(query)
     if youtube_music_track:
         return youtube_music_track
@@ -1418,21 +1391,9 @@ def get_audio_info(query: str) -> TrackInfo:
     if youtube_track:
         return youtube_track
 
-    # ── Remaining provider fallbacks ───────────────────────────────────────────
-    candidates = _search_secondary_platforms(query)
-    if candidates:
-        # Deduplicate equivalent CDN/page resolutions while retaining the
-        # highest-quality title match.
-        unique: dict[str, TrackInfo] = {}
-        for candidate in candidates:
-            current = unique.get(candidate["url"])
-            if current is None or _match_score(query, candidate) > _match_score(query, current):
-                unique[candidate["url"]] = candidate
-        return max(unique.values(), key=lambda item: _match_score(query, item))
-
     raise RuntimeError(
         "❌ لم يتم العثور على الأغنية في أي مصدر.\n"
-        "جرب اسمًا آخر أو اكتب اسم الفنان مع الأغنية."
+        "لم تنجح نتائج YouTube. جرب اسمًا آخر أو اكتب اسم الفنان مع الأغنية."
     )
 
 

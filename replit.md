@@ -5,7 +5,7 @@ A production-ready Telegram group management bot with a companion Pyrogram userb
 ## Stack
 - **python-telegram-bot v21** — main bot (async polling)
 - **Pyrogram** — assistant userbot for full member enumeration
-- **pytgcalls + yt-dlp + ytmusicapi** — voice chat music streaming
+- **pytgcalls + yt-dlp + ytmusicapi** — YouTube voice chat music streaming
 - **SQLite** — local member and auto-reply store
 
 ## Project Structure
@@ -58,9 +58,10 @@ Optional:
 
 Music search works without cookies by default. Song-name requests first search
 the YouTube Music catalog and extract a `music.youtube.com` stream. Standard
-YouTube is the next fallback, followed by SoundCloud and optional Spotify and
-Anghami metadata-guided searches. No browser cookies or restricted single-site
-URL is required unless an optional cookie jar is provided.
+YouTube is the next fallback, with optional Spotify and Anghami metadata used
+only to refine additional YouTube searches. SoundCloud is intentionally
+unsupported. No browser cookies or restricted single-site URL is required
+unless an optional cookie jar is provided.
 
 An optional local Netscape-format `cookies.txt` can be used to help yt-dlp
 avoid YouTube 403 responses. The file is Git-ignored and excluded from Docker
