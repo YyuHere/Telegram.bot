@@ -35,11 +35,28 @@ SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 # out of source control and set this to another mounted path in deployment.
 YTDLP_COOKIE_FILE: str = os.getenv("YTDLP_COOKIE_FILE", "cookies.txt")
 
-# Keep provider requests bounded. yt-dlp retries are disabled in the player;
-# these values only control the per-request timeout and the short cooldown
-# after YouTube blocks a request. Keep the YouTube client mobile-only: the
-# default Android client avoids the browser client path without requiring a
-# proxy or authentication cookie.
+# Shared yt-dlp options. Keep this exact baseline in one place so searches,
+# direct links, and stream extraction all use the same YouTube client pair and
+# mobile browser identity.
+YTDL_OPTIONS: dict = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        },
+    },
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Mobile Safari/537.36"
+        ),
+    },
+}
+
+# Keep provider requests bounded. These values control the per-request timeout
+# and the short cooldown after YouTube blocks a request.
 YTDLP_REQUEST_DELAY: float = float(os.getenv("YTDLP_REQUEST_DELAY", "1.5"))
 YTDLP_SOCKET_TIMEOUT: float = float(os.getenv("YTDLP_SOCKET_TIMEOUT", "8"))
 YTDLP_BLOCK_COOLDOWN: float = float(os.getenv("YTDLP_BLOCK_COOLDOWN", "60"))

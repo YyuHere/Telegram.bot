@@ -78,13 +78,12 @@ song, uses the mobile `android` YouTube client by default, and fails fast on
 through restricted browser clients. `android_vr` and `mweb` are supported as
 explicit tested alternatives.
 
-`YTDLP_PLAYER_CLIENT` can override the primary yt-dlp player client when a
-deployment has a tested mobile alternative. Unsupported values are normalized
-back to `android`; a long client rotation is intentionally unsupported because
-it multiplies YouTube requests and makes 429s more likely. `YTDLP_STREAM_TIMEOUT`
-bounds FFmpeg's direct CDN transport read. FFmpeg reconnects only for
-transient network/5xx/429 failures and does not reconnect at EOF, so completed
-songs advance normally.
+All yt-dlp operations use the shared Android + web player-client configuration
+and Android Chrome User-Agent in `config.py`. The request path is intentionally
+centralized so searches and direct stream resolution receive the same
+extractor arguments. `YTDLP_STREAM_TIMEOUT` bounds FFmpeg's direct CDN
+transport read. FFmpeg reconnects only for transient network/5xx/429 failures
+and does not reconnect at EOF, so completed songs advance normally.
 
 Playback requests are isolated by Telegram chat ID. `/play`, `/queue`,
 تشغيل, and قائمة share that chat's local queue; the next queued song starts

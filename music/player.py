@@ -540,17 +540,11 @@ def _is_direct_audio_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DIRECT_AUDIO_EXTS)
 
 
-# Keep the client fallback deliberately small. Each client attempt can trigger
-# several YouTube requests, so cycling through a long list amplifies 429s and
-# bot challenges instead of improving reliability.
-#
-# Mobile clients are intentionally the only supported YouTube path here.
-# "web", "tv", "ios", and browser-cookie fallbacks are excluded: rotating
-# through restricted clients multiplies requests and makes 429s more likely.
-# android_vr remains available as an explicit configuration alternative, but
-# android is the default AnonXMusic-compatible client.
+# Keep one bounded client attempt. It uses both requested clients together so
+# every search and stream resolution receives the same extractor arguments
+# without multiplying requests through a long fallback rotation.
 _CLIENT_FALLBACK_CHAIN: tuple[tuple[str, ...], ...] = (
-    (config.YTDLP_PLAYER_CLIENT,),
+    ("android", "web"),
 )
 
 _YOUTUBE_BLOCK_KEYWORDS = (
@@ -661,39 +655,27 @@ def _client_fallback_chain(
     *,
     use_cookies: bool,
 ) -> tuple[tuple[str, ...], ...]:
-    """Return the one mobile client, regardless of cookie availability."""
-    # Cookie presence must never change the client to web_safari or another
-    # restricted browser path. An empty/missing cookie jar simply means the
-    # same unauthenticated mobile extraction is used.
+    """Return the shared Android/web client pair regardless of cookies."""
     return _CLIENT_FALLBACK_CHAIN
 
 
 def _ydl_opts(
     extra: dict | None = None,
-    player_clients: tuple[str, ...] = (config.YTDLP_PLAYER_CLIENT,),
+    player_clients: tuple[str, ...] = ("android", "web"),
     *,
     use_cookies: bool = False,
 ) -> dict:
-    """
-    Build yt-dlp options with realistic browser headers and a YouTube player
-    client that survives SABR-only enforcement.
-
-    YouTube began forcing SABR streaming on the "web" client in 2026, which
-    removed the direct adaptiveFormats playback URLs yt-dlp relied on. "ios"
-    still requires a PO Token to unlock formats. Which of the remaining
-    clients (tv / android_vr / android / mweb) actually returns usable
-    formats varies by video and changes over time, so no single format
-    string can assume itag 18 will always be there — "best" is left as the
-    final catch-all rather than hard-requiring it. See:
-    https://github.com/yt-dlp/yt-dlp/issues/12482
-    """
+    """Build consistent yt-dlp options for every provider operation."""
+    # Copy nested values before adding request-specific options. This prevents
+    # one extraction call from mutating the global baseline for later calls.
     opts: dict = {
-        # No specific itag is guaranteed across clients, so prefer an
-        # audio-only stream when one exists and otherwise fall through to
-        # whatever the client actually returns.
-        # AnonXMusic-style audio-first selection: prefer native audio-only
-        # M4A, then any audio-only format, and use mixed media only last.
-        "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/best",
+        **config.YTDL_OPTIONS,
+        "extractor_args": {
+            "youtube": {
+                "player_client": list(player_clients),
+            },
+        },
+        "http_headers": dict(config.YTDL_OPTIONS["http_headers"]),
         "quiet": True,
         # Messages are still captured — just routed through our own
         # logger (see _YtdlpDiagnosticLogger) instead of being discarded.
@@ -733,17 +715,6 @@ def _ydl_opts(
         "writeannotations": False,
         # Extraction failures must raise so the fallback can classify them.
         "ignoreerrors": False,
-        "extractor_args": {
-            "youtube": {"player_client": list(player_clients)},
-        },
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-        },
     }
     if extra:
         opts.update(extra)

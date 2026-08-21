@@ -12,7 +12,7 @@ tgcrypto==1.2.5
 py-tgcalls==2.2.11
 
 # Audio download / stream URL resolution
-yt-dlp>=2026.0.0
+yt-dlp
 
 # JavaScript interpreter for yt-dlp challenge solver
 js2py>=0.74

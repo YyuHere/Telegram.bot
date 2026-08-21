@@ -19,8 +19,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir -U yt-dlp
+RUN pip install --no-cache-dir --upgrade yt-dlp
 
 COPY . .
 
-CMD ["python", "main.py"]
+CMD ["sh", "start.sh"]
